@@ -1,0 +1,25 @@
+{
+  "_comentario": "Configuracao dos kits de bateria do DrumGizmo. 'active' e o kit atualmente selecionado. 'alsa_device' controla qual placa de som usar: deixe 'auto' para deteccao automatica via /proc/asound/cards (recomendado, funciona em qualquer Raspberry com uma unica placa USB conectada); so defina manualmente (ex: 'plughw:Device') se houver mais de uma placa USB conectada ao mesmo tempo, ou nenhuma detectada -- isso tambem pode ser configurado pela aba SISTEMA no console web.",
+  "_comentario_alsa_device": "'auto' = detectar sozinho a unica placa USB-Audio presente em /proc/asound/cards e montar 'plughw:<id>'. Qualquer outro valor (ex: 'plughw:Device' ou 'hw:1,0') e usado como override manual, tem prioridade sobre a deteccao automatica.",
+  "active": "Padrão",
+  "midi_port_name": "ESP32 Drum",
+  "alsa_device": "auto",
+  "_comentario_kits": "Estes 3 caminhos ja sao os finais que o setup_kits.py gera -- rode 'python3 setup_kits.py' (ver README) ANTES de iniciar o servico pela primeira vez, pra essas pastas existirem de verdade.",
+  "kits": {
+    "Padrão": {
+      "cwd": "~/DrumGizmo/kits/kits/test-kit-oficial/kits/test_16bit_pi",
+      "kit_xml": "test_pi.xml",
+      "midimap": "midimap_pi.xml"
+    },
+    "Ludwig": {
+      "cwd": "~/DrumGizmo/kits/kits/ludwig-black-cortex/Ludwig_pi",
+      "kit_xml": "Drumkit_pi.xml",
+      "midimap": "Midimap.xml"
+    },
+    "Crocell": {
+      "cwd": "~/DrumGizmo/kits/kits/crocellkit/CrocellKit_pi3",
+      "kit_xml": "CrocellKit_tiny2_pi.xml",
+      "midimap": "Midimap_tiny2.xml"
+    }
+  }
+}

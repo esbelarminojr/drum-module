@@ -1,0 +1,43 @@
+[Unit]
+# Sobe o backend do módulo de bateria (ESP32 <-> DrumGizmo <-> console web)
+# assim que o Raspberry liga, sem precisar de terminal nem login manual.
+Description=Drum Module Backend (ESP32 <-> DrumGizmo <-> console web)
+After=network.target sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+User=__DRUM_USER__
+Group=__DRUM_GROUP__
+
+WorkingDirectory=__DRUM_DIR__
+ExecStart=/usr/bin/python3 __DRUM_DIR__/drum_backend.py
+
+# dá um respiro pro systemd/udev terminarem de configurar os dispositivos
+# USB (ESP32 + placa de som) antes da primeira tentativa -- o próprio
+# script já espera/tenta de novo sozinho por dentro, isso aqui é só uma
+# folga extra pro caso mais comum (boot do zero)
+ExecStartPre=/bin/sleep 5
+
+# Garante que o PipeWire/WirePlumber (áudio de desktop do usuário) não
+# fique disputando a placa USB com o DrumGizmo -- já vimos os dois
+# brigarem pelo mesmo dispositivo ("snd_pcm_open failed"). O "-" na
+# frente ignora erro (ex: já estava parado/mascarado, ou a sessão do
+# usuário não estava disponível ainda) -- nunca impede o resto do
+# serviço de subir. O "+" na frente faz ESSA LINHA rodar como root
+# mesmo o serviço todo sendo "User=__DRUM_USER__" -- precisa disso
+# porque `runuser` só pode ser chamado por root.
+ExecStartPre=-+/usr/sbin/runuser -l __DRUM_USER__ -c 'systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire pipewire-pulse wireplumber'
+ExecStartPre=-+/usr/sbin/runuser -l __DRUM_USER__ -c 'systemctl --user mask pipewire.socket pipewire-pulse.socket pipewire pipewire-pulse wireplumber'
+
+# se cair por qualquer motivo (ESP32 desconectada, erro do DrumGizmo,
+# etc.), tenta subir de novo sozinho em vez de ficar parado
+Restart=on-failure
+RestartSec=5
+
+# aparece no `journalctl -u drum-backend` com esse nome, junto com todo
+# o log que já existia no terminal (print() do backend e do kit_manager)
+SyslogIdentifier=drum-backend
+
+[Install]
+WantedBy=multi-user.target
