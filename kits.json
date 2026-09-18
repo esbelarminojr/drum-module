@@ -18,8 +18,8 @@
     },
     "Crocell": {
       "cwd": "~/DrumGizmo/kits/kits/crocellkit/CrocellKit_pi3",
-      "kit_xml": "CrocellKit_tiny2_pi.xml",
-      "midimap": "Midimap_tiny2.xml"
+      "kit_xml": "CrocellKit_tiny22_pi.xml",
+      "midimap": "Midimap_tiny22.xml"
     }
   }
 }

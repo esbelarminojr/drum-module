@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <title>Drum Module Console</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap');
@@ -1550,6 +1551,7 @@
       velMax: 1000,
       lockout: 50,
       curve: "Linear",
+      ativo: true,
       lastVel: 0,
       lastNote: p.midi,
       signal: 0,
@@ -1558,10 +1560,33 @@
   });
 
   var GLOBAL = { peakTime:12, minVel:5, noteDuration:3, midiChannel:1 };
+  // true assim que os 4 valores de GLOBAL acima vieram confirmados do
+  // ESP32 pelo menos uma vez (ver applyBackendSnapshot) -- false enquanto
+  // isso não acontece, os números mostrados na aba GLOBAL são só o
+  // valor padrão do próprio HTML, não o que está de fato salvo no ESP32.
+  var globalSynced = false;
+
+  // Volume por pad (ver pad_mixer.py no backend) -- chave = nota MIDI
+  // da peça (string, porque é assim que volta do backend em JSON).
+  // Guardado só no Raspberry, não no ESP32 -- ver comentário em cima de
+  // pad_mixer.py pro porquê. Populado lendo /api/mixer ao conectar.
+  var mixerState = {};
+  function getMixer(note){
+    return mixerState[String(note)] || {volume:1.0};
+  }
+
+  // estado da "definição manual" (MIDI-learn): null = parado, ou
+  // {targetNote} enquanto esperando a próxima pancada física.
+  var learnState = null;
 
   var HIHAT = {
     active:true, tipo:"Potenciômetro", open:0, closed:1900, filtro:8, invertido:false,
-    swActive:false, swInvertido:false, swForcar:true
+    swActive:false, swInvertido:false, swForcar:true,
+    // limiares de POSIÇÃO NORMALIZADA (0-127, mesma escala mostrada em
+    // "Posição normalizada" mais abaixo) que decidem qual nota o pedal
+    // manda -- diferente de "aberto"/"fechado" acima, que são a
+    // calibração do sensor bruto (ADC). 0=totalmente aberto, 127=fechado.
+    limiarMeioAberto: 40, limiarFechado: 100
   };
   var HH_TYPES = ["OFF","Potenciômetro","Hall","IR"];
 
@@ -2280,12 +2305,41 @@
       return;
     }
     var st = padState[selectedPad];
+    var pad = padById(selectedPad);
+    var mix = getMixer(pad.midi);
+    var volPct = Math.round(mix.volume * 100);
+
+    var learnHtml;
+    if(learnState && learnState.targetNote === pad.midi){
+      learnHtml =
+        '<div class="tab-placeholder" id="learn-status" style="margin-top:16px">' +
+          'Bata na peça física que você quer que passe a mandar o som de <b>' + pad.name + '</b> agora...' +
+          '<button class="kit-custom-btn" id="learn-cancel-btn" type="button" style="margin-top:8px">Cancelar</button>' +
+        '</div>';
+    } else {
+      learnHtml =
+        '<button class="kit-custom-btn" id="learn-start-btn" type="button" style="margin-top:16px" ' +
+          (backendOnline ? '' : 'disabled title="precisa estar conectado ao Raspberry"') + '>' +
+          'Definição manual (bater na peça)' +
+        '</button>' +
+        '<div class="field-label" style="margin-top:6px"><span style="opacity:.7;font-size:11px;text-transform:none;letter-spacing:normal">' +
+          'Em vez de escolher pela imagem: clique aqui e bata na peça física que você quer que passe a mandar o som de "' + pad.name + '".' +
+        '</span></div>';
+    }
+
     body.innerHTML =
       '<div><div class="row-label"><span>Curva de velocidade</span></div>' +
       '<div class="segmented" id="curve-seg">' +
         CURVES.map(function(c){ return '<button data-c="'+c+'" class="'+(st.curve===c?"active":"")+'">'+c+'</button>'; }).join("") +
       '</div></div>' +
-      '<div class="toggle-row is-on"><span class="lbl">Pad ativo</span><div class="switch on" id="pad-active-sw"></div></div>';
+      '<div class="toggle-row' + (st.ativo ? " is-on" : "") + '"><span class="lbl">Pad ativo</span><div class="switch' + (st.ativo ? " on" : "") + '" id="pad-active-sw"></div></div>' +
+
+      '<div class="field" style="margin-top:16px">' +
+        '<div class="field-label"><span>Volume desta peça</span><span class="field-value" id="mv-vol">' + volPct + '%</span></div>' +
+        '<input type="range" id="m-vol" min="0" max="300" step="1" value="' + volPct + '">' +
+        '<div class="field-label" style="margin-top:4px"><span style="opacity:.6;font-size:11px;text-transform:none;letter-spacing:normal">0% = mudo de verdade. Acima de 100% reforça uma peça fraca -- mas numa pancada que já chega forte (perto do máximo) não tem muito mais o que aumentar, isso é físico.</span></div>' +
+      '</div>' +
+      learnHtml;
 
     $all("#curve-seg button").forEach(function(b){
       b.addEventListener("click", function(){
@@ -2297,13 +2351,60 @@
     });
     var sw = $("#pad-active-sw");
     sw.addEventListener("click", function(){
-      sw.classList.toggle("on");
-      sw.closest(".toggle-row").classList.toggle("is-on");
+      st.ativo = !st.ativo;
+      sw.classList.toggle("on", st.ativo);
+      sw.closest(".toggle-row").classList.toggle("is-on", st.ativo);
+      if(backendOnline) backendPost("/api/pad/" + selectedPad, {ativo: st.ativo ? 1 : 0});
     });
+
+    $("#m-vol").addEventListener("input", function(e){
+      $("#mv-vol").textContent = e.target.value + "%";
+    });
+    $("#m-vol").addEventListener("change", function(e){
+      var v = (+e.target.value) / 100;
+      mixerState[String(pad.midi)] = Object.assign({}, mix, {volume: v});
+      if(backendOnline) backendPost("/api/mixer/" + pad.midi + "/volume", {value: v});
+    });
+
+    var learnStartBtn = $("#learn-start-btn");
+    if(learnStartBtn){
+      learnStartBtn.addEventListener("click", function(){
+        backendPost("/api/learn/start", {note: pad.midi}).then(function(r){
+          if(r && r.ok){
+            learnState = {targetNote: pad.midi};
+            renderPadTab(body);
+          }
+        });
+      });
+    }
+    var learnCancelBtn = $("#learn-cancel-btn");
+    if(learnCancelBtn){
+      learnCancelBtn.addEventListener("click", function(){
+        backendPost("/api/learn/cancel", {}).then(function(){
+          learnState = null;
+          renderPadTab(body);
+        });
+      });
+    }
+  }
+
+  function syncFromEsp32(onDone){
+    if(!backendOnline) return;
+    backendPost("/api/refresh", {}).then(function(snap){
+      if(snap && snap.ok) applyBackendSnapshot(snap);
+      if(onDone) onDone(!!(snap && snap.ok));
+    }).catch(function(){ if(onDone) onDone(false); });
   }
 
   function renderGlobalTab(body){
-    body.innerHTML =
+    var warning = (backendOnline && !globalSynced)
+      ? '<div class="tab-placeholder" style="margin-bottom:10px">' +
+          'Ainda não recebi a confirmação do ESP32 pra estes valores -- podem não ' +
+          'ser os que estão realmente salvos nele. ' +
+          '<button class="kit-custom-btn" id="g-sync-btn" type="button" style="margin-top:8px">Sincronizar com o ESP32</button>' +
+        '</div>'
+      : '';
+    body.innerHTML = warning +
       '<div class="field">' +
         '<div class="field-label"><span>Tempo do pico</span><span class="field-value" id="gv-peak">' + GLOBAL.peakTime + ' ms</span></div>' +
         '<input type="range" id="g-peak" min="1" max="40" value="' + GLOBAL.peakTime + '">' +
@@ -2338,6 +2439,19 @@
     $("#g-minvel").addEventListener("change", syncGlobal);
     $("#g-dur").addEventListener("change", syncGlobal);
     $("#g-ch").addEventListener("change", syncGlobal);
+
+    var syncBtn = $("#g-sync-btn");
+    if(syncBtn){
+      syncBtn.addEventListener("click", function(){
+        syncBtn.textContent = "Sincronizando...";
+        syncBtn.disabled = true;
+        syncFromEsp32(function(ok){
+          if(activeTab !== "GLOBAL") return;
+          if(!ok){ syncBtn.textContent = "Falhou -- tentar de novo"; syncBtn.disabled = false; }
+          // se deu certo, applyBackendSnapshot já chamou renderPanel() -> renderGlobalTab() de novo
+        });
+      });
+    }
   }
 
   var hihatLiveTimer = null;
@@ -2389,6 +2503,18 @@
         '<div class="field-label"><span>Filtro</span><span class="field-value" id="hh-filterv">' + HIHAT.filtro + '</span></div>' +
         '<input type="range" id="hh-filter" min="0" max="20" value="' + HIHAT.filtro + '">' +
       '</div>' +
+      '<div class="field-label" style="margin-top:16px"><span>Limiares de nota (posição 0-127)</span></div>' +
+      '<div class="field-label" style="margin-top:-6px"><span style="opacity:.7;font-size:11px;text-transform:none;letter-spacing:normal">' +
+        'Decidem qual som toca com o sensor contínuo (0=totalmente aberto, 127=fechado) -- diferente da calibração acima, que é o valor bruto do sensor. O limiar "meio-aberto" tem que ficar MENOR que o "fechado".' +
+      '</span></div>' +
+      '<div class="field">' +
+        '<div class="field-label"><span>Início do meio-aberto</span><span class="field-value" id="hh-limmav">' + HIHAT.limiarMeioAberto + '</span></div>' +
+        '<input type="range" id="hh-limma" min="0" max="127" value="' + HIHAT.limiarMeioAberto + '">' +
+      '</div>' +
+      '<div class="field">' +
+        '<div class="field-label"><span>Início do fechado</span><span class="field-value" id="hh-limfv">' + HIHAT.limiarFechado + '</span></div>' +
+        '<input type="range" id="hh-limf" min="0" max="127" value="' + HIHAT.limiarFechado + '">' +
+      '</div>' +
       row("Invertido","invertido","hh-invert") +
       row("Switch ativo","swActive","hh-sw-active") +
       row("Switch invertido","swInvertido","hh-sw-invert") +
@@ -2412,7 +2538,9 @@
         aberto: HIHAT.open,
         fechado: HIHAT.closed,
         filtro: HIHAT.filtro,
-        invertido: HIHAT.invertido ? 1 : 0
+        invertido: HIHAT.invertido ? 1 : 0,
+        limiar_meio_aberto: HIHAT.limiarMeioAberto,
+        limiar_fechado: HIHAT.limiarFechado
       });
     }
     function syncHihatSwitch(){
@@ -2443,9 +2571,13 @@
     $("#hh-open").addEventListener("input", function(e){ HIHAT.open = +e.target.value; $("#hh-openv").textContent = HIHAT.open; });
     $("#hh-closed").addEventListener("input", function(e){ HIHAT.closed = +e.target.value; $("#hh-closedv").textContent = HIHAT.closed; });
     $("#hh-filter").addEventListener("input", function(e){ HIHAT.filtro = +e.target.value; $("#hh-filterv").textContent = HIHAT.filtro; });
+    $("#hh-limma").addEventListener("input", function(e){ HIHAT.limiarMeioAberto = +e.target.value; $("#hh-limmav").textContent = HIHAT.limiarMeioAberto; });
+    $("#hh-limf").addEventListener("input", function(e){ HIHAT.limiarFechado = +e.target.value; $("#hh-limfv").textContent = HIHAT.limiarFechado; });
     $("#hh-open").addEventListener("change", syncHihat);
     $("#hh-closed").addEventListener("change", syncHihat);
     $("#hh-filter").addEventListener("change", syncHihat);
+    $("#hh-limma").addEventListener("change", syncHihat);
+    $("#hh-limf").addEventListener("change", syncHihat);
   }
 
   // -- aba "SISTEMA": informações/config que dependem da MÁQUINA em si
@@ -2513,7 +2645,25 @@
 
       '<div class="field-label" style="margin-top:14px"><span>Porta MIDI virtual</span></div>' +
       '<div class="field-label" style="margin-top:-6px"><span style="opacity:.7;font-size:11px;text-transform:none;letter-spacing:normal">' +
-        (info.midi_port_name || "-") + ' (criada por este backend, sempre a mesma -- não precisa configurar)</span></div>';
+        (info.midi_port_name || "-") + ' (criada por este backend, sempre a mesma -- não precisa configurar)</span></div>' +
+
+      '<div class="field-label" style="margin-top:20px"><span>Sincronização com o ESP32</span></div>' +
+      '<div class="field-label" style="margin-top:-6px"><span style="opacity:.7;font-size:11px;text-transform:none;letter-spacing:normal">' +
+        (globalSynced ? "Valores confirmados pelo ESP32." : "Ainda sem confirmação do ESP32 pra pads/global/hi-hat.") + '</span></div>' +
+      '<div style="margin-top:10px;display:flex;align-items:center;gap:10px">' +
+        '<button class="kit-custom-btn" id="sys-sync-btn" type="button">Sincronizar agora</button>' +
+        '<span id="sys-sync-msg" style="font-size:11px;opacity:.8"></span>' +
+      '</div>';
+
+    $("#sys-sync-btn").addEventListener("click", function(){
+      var msg = $("#sys-sync-msg");
+      msg.textContent = "Sincronizando...";
+      syncFromEsp32(function(ok){
+        if(activeTab !== "SISTEMA") return;
+        msg.textContent = ok ? "Sincronizado!" : "Falhou -- confira se o ESP32 está ligado/conectado.";
+        if(ok) setTimeout(function(){ if(activeTab === "SISTEMA") renderSystemTab(body); }, 1200);
+      });
+    });
 
     $("#sys-audio-save").addEventListener("click", function(){
       var val = $("#sys-audio-device").value;
@@ -2632,23 +2782,42 @@
         st.velMax = p.velmax;
         st.lockout = p.lockout;
         st.curve = CURVES[p.curva] || CURVES[0];
+        st.ativo = !!p.ativo;
       });
     }
-    if(snap.global){
+    // IMPORTANTE: o backend só preenche global_config/hh_config/hhsw_config
+    // depois que o ESP32 responder um GET (BEGINCONFIG..ENDCONFIG). Se o
+    // ESP32 ainda não sincronizou (ex: acabou de reiniciar e ainda não
+    // respondeu), essas chaves chegam como um objeto VAZIO {} -- que em
+    // JavaScript é "truthy" -- então sem essa checagem de conteúdo os campos
+    // abaixo viravam "undefined"/"NaN" na tela (esse era o bug de "as
+    // configurações globais não aparecem": não é que sumiam, é que o
+    // backend ainda não tinha os valores reais do ESP32 quando o HTML
+    // pediu, e a tela mostrava lixo em vez de manter os valores antigos).
+    if(snap.global && Object.keys(snap.global).length >= 4){
       GLOBAL.peakTime = snap.global.peak_time;
       GLOBAL.minVel = snap.global.min_velocity;
       GLOBAL.noteDuration = snap.global.note_duration;
       GLOBAL.midiChannel = snap.global.midi_channel;
+      globalSynced = true;
+    } else {
+      globalSynced = false;
     }
-    if(snap.hh){
+    if(snap.hh && Object.keys(snap.hh).length >= 6){
       HIHAT.active = !!snap.hh.ativo;
       HIHAT.tipo = HH_TYPES[snap.hh.tipo] || HH_TYPES[0];
       HIHAT.open = snap.hh.aberto;
       HIHAT.closed = snap.hh.fechado;
       HIHAT.filtro = snap.hh.filtro;
       HIHAT.invertido = !!snap.hh.invertido;
+      // limiar_meio_aberto/limiar_fechado só existem com firmware/backend
+      // atualizados (protocolo HH de 8 parâmetros) -- com um firmware mais
+      // antigo, essas duas chaves simplesmente não vêm, e os valores
+      // padrão da tela (definidos junto com HIHAT, acima) continuam valendo.
+      if('limiar_meio_aberto' in snap.hh) HIHAT.limiarMeioAberto = snap.hh.limiar_meio_aberto;
+      if('limiar_fechado' in snap.hh) HIHAT.limiarFechado = snap.hh.limiar_fechado;
     }
-    if(snap.hhsw){
+    if(snap.hhsw && Object.keys(snap.hhsw).length >= 3){
       HIHAT.swActive = !!snap.hhsw.ativo;
       HIHAT.swInvertido = !!snap.hhsw.invertido;
       HIHAT.swForcar = !!snap.hhsw.forcar_fechado;
@@ -2702,6 +2871,18 @@
     }
     if(msg.type === "kit"){
       console.log("[drum] kit ativo no DrumGizmo agora:", msg.kit);
+      return;
+    }
+    if(msg.type === "learn_result"){
+      var wasLearning = learnState !== null;
+      learnState = null;
+      if(!msg.ok){
+        console.log("[drum] definição manual não concluída:", msg.error);
+        if(wasLearning) alert(msg.error || "Não consegui reconhecer a pancada.");
+      } else {
+        console.log("[drum] definição manual concluída: pad " + msg.pad_idx + " agora manda a nota " + msg.new_note + " (era " + msg.old_note + ")");
+      }
+      if(activeTab === "PAD") renderTabBody();
       return;
     }
     if(msg.type === "kit_progress"){
@@ -2779,6 +2960,10 @@
       updateKitLoadButton(KITS[currentKitIndex]);
       updateConnIndicator();
       openBackendSocket();
+      backendGet("/api/mixer").then(function(m){
+        mixerState = m || {};
+        if(activeTab === "PAD") renderTabBody();
+      }).catch(function(){});
       console.log("[drum] backend conectado -- modo hardware ativo");
     }).catch(function(){
       backendOnline = false;

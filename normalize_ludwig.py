@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
-normalize_ludwig_v2.py
+normalize_ludwig.py
 ================================================================
 Normaliza o volume dos .wav de um kit DrumGizmo POR INSTRUMENTO
 (nao um ganho global unico) -- necessario quando instrumentos
@@ -23,10 +24,10 @@ Como funciona:
 Faz backup da pasta de samples original antes de mexer.
 
 Uso:
-    python3 normalize_ludwig_v2.py <pasta_instrument_xmls> <pasta_samples> [--target-db -3.0] [--dry-run]
+    python3 normalize_ludwig.py <pasta_instrument_xmls> <pasta_samples> [--target-db -3.0] [--dry-run]
 
 Exemplo (Ludwig Black Cortex):
-    python3 normalize_ludwig_v2.py \
+    python3 normalize_ludwig.py \
         ~/DrumGizmo/kits/kits/ludwig-black-cortex/Kit \
         ~/DrumGizmo/kits/kits/ludwig-black-cortex/Kit/Samples
 """

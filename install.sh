@@ -1,7 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ================================================================
 # install.sh -- instala/atualiza o drum-backend.service detectando
-# sozinho o usuário e a pasta certos, em vez de vir com "ju" fixo.
+# sozinho o usuário e a pasta certos, em vez de vir com um usuário fixo.
 #
 # Uso normal (rodando de dentro da pasta onde estão os arquivos,
 # como o próprio usuário dono, ex: ju):

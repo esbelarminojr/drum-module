@@ -1,36 +1,44 @@
-# Módulo de Bateria Eletrônica (ESP32 + DrumGizmo + Raspberry Pi)
+# drum-module -- Módulo de Bateria Eletrônica (ESP32 + DrumGizmo + Raspberry Pi)
 
 Backend que liga um módulo de bateria eletrônica baseado em ESP32 ao
 [DrumGizmo](https://drumgizmo.org/) rodando num Raspberry Pi, com um
 console web (`drum-module-console.html`) pra configurar tudo pelo
 celular/tablet enquanto o Pi toca o som.
 
+Licenciado sob a [GPL-3.0-or-later](LICENSE) -- veja a seção
+"Licença" no final deste README pra detalhes (inclusive sobre as
+amostras de áudio de terceiros, que **não** são cobertas por ela).
+
 Este repositório é o instalador "do zero": ele baixa as amostras
 originais de cada kit direto da internet e aplica por cima, sozinho,
-todas as correções específicas de cada kit que foram descobertas na
-prática (ver `slim_crocell.py` e a seção "O que cada kit precisa" mais
-abaixo) -- assim, reinstalar num Raspberry novo (ou recuperar este
-depois de um cartão SD corrompido) não exige mais caçar os mesmos bugs
-de novo.
+todas as correções específicas de cada kit que já são conhecidas (ver
+`slim_crocell.py` e a seção "O que cada kit precisa" mais abaixo) --
+assim, instalar num Raspberry novo (ou recuperar de um cartão SD
+corrompido) não exige caçar os mesmos problemas de novo.
 
 ## O que tem aqui
 
 ```
+LICENSE                           -- GPL-3.0-or-later (ver seção "Licença" no final)
 drum_backend.py                   -- backend (Flask + WebSocket + MIDI)
 kit_manager.py                    -- controla o processo do DrumGizmo
+pad_mixer.py                      -- volume por pad (guardado no Pi, não no ESP32 -- ver "Mixer por pad")
 drum-module-console.html          -- console web (servido pelo backend)
 install.sh                        -- instala o serviço systemd
 drum-backend.service.template     -- modelo do serviço (install.sh preenche)
+setup_rtpmidi.sh                  -- (opcional) expõe o MIDI pela rede pra gravar no PC -- ver "RTP-MIDI"
+setup_shutdown_button.sh          -- (opcional) botão físico de liga/desliga seguro -- ver "Botão de liga/desliga"
 kits.json                         -- configuração dos kits (setup_kits.py atualiza sozinho)
+pad_mixer.json                    -- volume salvo por pad (criado sozinho no primeiro ajuste)
 setup_kits.py                     -- baixa e monta os 3 kits do zero (ver Passo 4)
 slim_crocell.py                   -- reduz canais/camadas de um kit DrumGizmo pra caber na RAM do Pi
                                       (generalizado: se adaptar sozinho a qualquer kit novo que
                                       tenha uma "particularidade" parecida com as 3 já resolvidas --
                                       ver o cabeçalho do próprio arquivo pra detalhes)
 build_hihat_pedal_kit.py          -- adiciona o instrumento HihatPedal (nota 44) ao Crocell
-normalize_ludwig_v2.py            -- normaliza volume por instrumento (necessário só pro Ludwig)
+normalize_ludwig.py               -- normaliza volume por instrumento (necessário só pro Ludwig)
 firmware/
-  bateria_eletronica-03-09.ino    -- firmware do ESP32 (Arduino IDE)
+  firmware.ino                    -- firmware do ESP32 (abra a PASTA firmware/ no Arduino IDE)
   config_bateria.h                -- configuração dos pinos/notas/limiares
 ```
 
@@ -84,17 +92,21 @@ drumgizmo --version
 
 ## 3. Copiar os arquivos deste repositório pro Pi
 
-Se o Pi tiver acesso à internet, o mais simples é clonar direto nele:
+Se o Pi tiver acesso à internet, o mais simples é clonar direto nele
+(por padrão isso já cria a pasta `~/drum-module`, com esse nome, sem
+precisar especificar):
 
 ```
-git clone <url-do-seu-repositorio-no-github> ~/drum-module
-cd ~/drum-module
+git clone https://github.com/<seu-usuario>/drum-module.git
+cd drum-module
 ```
 
-Ou, do seu computador, `scp -r` a pasta descompactada:
+Ou, do seu computador, `scp -r` a pasta descompactada (mantendo o
+mesmo nome `drum-module`, pra bater com o resto deste guia e com o
+que o `install.sh` vai detectar sozinho):
 
 ```
-scp -r drum-module-package <usuario>@<ip-do-pi>:~/drum-module
+scp -r drum-module <usuario>@<ip-do-pi>:~/drum-module
 ```
 
 ## 4. Montar os kits (baixa da internet e aplica as correções sozinho)
@@ -121,15 +133,23 @@ Isso baixa e monta, do zero, os 3 kits usados neste projeto:
   deste projeto (o midimap original do kit usa notas MIDI diferentes
   das que o firmware do ESP32 realmente envia).
 - **Ludwig** (Black Cortex) -- clonado do GitHub, depois passa por uma
-  normalização de volume por instrumento (`normalize_ludwig_v2.py`,
+  normalização de volume por instrumento (`normalize_ludwig.py`,
   necessária porque os instrumentos foram gravados/exportados com
   níveis bem diferentes entre si) antes de ser reduzido.
-- **Crocell** -- baixado como `.zip`, primeiro ganha o instrumento
-  `HihatPedal` (nota 44) que não vem na variante "tiny" usada de base
-  (`build_hihat_pedal_kit.py` copia esse instrumento da variante "full"
-  do próprio kit), depois é reduzido com um ajuste manual de canal
-  (`--channel-map`) pro Ride, que tem um microfone próprio separado dos
-  overheads e senão a detecção automática escolheria o par errado.
+- **Crocell** -- baixado como `.zip`, primeiro ganha os instrumentos
+  `HihatPedal` (nota 44, pedal chick) e `HihatSemiOpen` (nota 80,
+  chimbal meio-aberto) que não vêm na variante "tiny" usada de base --
+  duas passadas encadeadas de `build_hihat_pedal_kit.py`, cada uma
+  copiando o instrumento da variante "full" do próprio kit (gera
+  `CrocellKit_tiny2.xml` e depois `CrocellKit_tiny22.xml`) --, depois é
+  reduzido com um ajuste manual de canal (`--channel-map`) pro Ride,
+  que tem um microfone próprio separado dos overheads e senão a
+  detecção automática escolheria o par errado. O `HihatSemiOpen` fica
+  disponível no kit/mapeamento, e o firmware do ESP32 já manda essa
+  nota sozinho pela posição do pedal (3 zonas -- aberto/meio-aberto/
+  fechado, com os dois limiares ajustáveis na aba HI-HAT do console) --
+  ver `BACKLOG.md` pra detalhes. **Precisa reflashar o ESP32** com o
+  `.ino` atualizado pra essa parte valer de verdade.
 
 No final, `python3 setup_kits.py` atualiza o `kits.json` sozinho
 apontando pros 3 kits prontos. Rodar de novo sem `--force` pula
@@ -183,12 +203,12 @@ E testa abrindo `http://<ip-do-pi>:8000` no celular.
 
 ## 6. Firmware do ESP32
 
-Se for usar o mesmo ESP32 de antes, não precisa reflashar -- ele já
-está com o firmware certo. Se for gravar um ESP32 novo (ou reflashar),
-abre `firmware/bateria_eletronica-03-09.ino` no Arduino IDE (a pasta
-`firmware/` tem que ter esse nome igual ao `.ino` por dentro, senão o
-Arduino IDE reclama -- se copiar solto, cria uma pasta com o mesmo nome
-do arquivo e coloca os dois dentro) e grava normalmente.
+Se o ESP32 já foi gravado com este mesmo firmware antes, não precisa
+reflashar. Se for um ESP32 novo (ou se quiser regravar por qualquer
+motivo), abre a pasta `firmware/` direto no Arduino IDE (File > Open, aponte pra
+pasta -- o nome dela já bate com `firmware.ino` por dentro, então abre
+sem precisar reorganizar nada) e grava normalmente. O `config_bateria.h`
+é reconhecido automaticamente como uma segunda aba do mesmo sketch.
 
 Pinos usados (ver `config_bateria.h` pra lista completa/ajustável):
 - 8 pads piezo: GPIOs 13, 14, 27, 26, 25, 33, 32, 35 (o último é o Hi-Hat)
@@ -203,6 +223,90 @@ boot e tenta detectar sozinho, mas é mais confiável já estar tudo
 plugado). Se precisar reconectar algo depois que o Pi já ligou, um
 `sudo systemctl restart drum-backend` resolve.
 
+## Mixer por pad (volume)
+
+Cada peça (identificada pela nota MIDI dela) pode ter um volume
+próprio, guardado em `pad_mixer.json` neste Raspberry -- **não** no
+ESP32 (a sensibilidade do trigger continua lá; isso aqui é só sobre
+como a nota que já chegou é tocada). Ajustável pela aba **PAD** do
+console (selecione a peça primeiro):
+
+- **Volume desta peça** (0% a 300%): escala a velocity da nota antes
+  de mandar pro DrumGizmo. Efeito **instantâneo** -- não recarrega o
+  kit. `POST /api/mixer/<nota>/volume {"value": 0.0 a 3.0}`. Em 0% a
+  nota nem chega a ser enviada -- mudo de verdade, não só "bem baixo".
+  Acima de 100% reforça uma peça fraca, mas numa pancada que já chega
+  perto do máximo não tem muito mais o que aumentar (limite físico da
+  velocity MIDI, teto em 127).
+
+(O balanço/pan esquerda-direita por pad foi removido -- ver
+`BACKLOG.md` pro motivo: um dos kits reais usava o mesmo arquivo de
+áudio pros dois canais numa peça, tornando o recurso não confiável o
+suficiente pra manter.)
+
+## Definição manual de pad ("bater pra configurar")
+
+Na aba **PAD**, ao configurar uma peça, o botão **"Definição manual
+(bater na peça)"** entra num modo de escuta por até 15 segundos: a
+próxima pancada física reconhecida faz aquele pad físico passar a
+mandar a nota da peça que estava sendo configurada, a partir de agora
+(reconfigura o ESP32 direto, com o mesmo comando `PAD` que a tela já
+usa) -- uma alternativa a escolher a peça pela imagem, útil se a
+fiação física não bate com a ordem esperada pelo firmware.
+
+## RTP-MIDI -- gravar no PC (Reaper, EZdrummer, Addictive Drums, etc.)
+
+Opcional, só pra quem quiser gravar no computador -- o uso ao vivo (com
+os celulares/tablets dos músicos) não precisa disso.
+
+```
+sudo ./setup_rtpmidi.sh
+```
+
+Isso instala e configura o [rtpmidid](https://github.com/davidmoreno/rtpmidid)
+(RTP-MIDI/AppleMIDI pra Linux), expondo a porta MIDI virtual "ESP32
+Drum" pela rede. No Windows, instale o driver gratuito **rtpMIDI** (de
+Tobias Erichsen) -- este Raspberry deve aparecer sozinho na lista
+"Remote Sessions" (via Bonjour/mDNS); clique "Connect". Depois disso,
+qualquer DAW no Windows (Reaper, etc.) vai ver uma porta MIDI de
+entrada nova pra escolher na faixa do instrumento (EZdrummer/Addictive
+Drums).
+
+Recomendado pra **gravar** (diferente do uso ao vivo, que é por Wi-Fi
+mesmo): ligar um cabo de rede direto entre o Raspberry e o PC, sem
+roteador no meio -- menos latência e bem mais estável que Wi-Fi.
+
+Aviso: este script ainda não foi validado contra hardware real em
+todas as versões do Raspberry Pi OS (foi escrito com base na
+documentação oficial do rtpmidid) -- por segurança, ele avisa e para
+(em vez de adivinhar) se algum passo não bater com o esperado (ex:
+pacote não disponível no `apt` desta versão do sistema -- nesse caso
+ele mesmo mostra como baixar o `.deb` direto do GitHub). Se algo
+falhar, o aviso impresso já indica o comando alternativo pra rodar;
+se mesmo assim não resolver, abra uma
+[issue](https://github.com/esbelarminojr/drum-module/issues) neste
+repositório descrevendo o que apareceu.
+
+## Botão físico de liga/desliga seguro
+
+Pra desligar com segurança sem precisar de tela/teclado/SSH (evita
+corromper o cartão SD por tirar da tomada direto -- ver o item do
+Wi-Fi que "some" mais abaixo):
+
+```
+sudo ./setup_shutdown_button.sh
+sudo reboot
+```
+
+Fiação (na hora de montar a caixa física): um botão simples entre o
+pino físico 5 (GPIO3) e o pino físico 6 (GND, bem ao lado) na régua de
+40 pinos. Depois de reiniciar: apertar desliga com segurança (igual
+`sudo shutdown -h now`); apertar de novo com o Raspberry desligado,
+liga -- na prática um botão único de liga/desliga. Isso desliga o
+sistema operacional com segurança, mas não corta a energia física --
+ainda precisa tirar da tomada depois (só que aí sem risco, esperando o
+LED verde parar de piscar antes).
+
 ## Solução de problemas rápida
 
 - `journalctl -u drum-backend -n 50 --no-pager` -- log do backend (Python)
@@ -211,16 +315,31 @@ plugado). Se precisar reconectar algo depois que o Pi já ligou, um
 - Se der "dispositivo ocupado" no ALSA logo depois de trocar de kit, espera alguns segundos e tenta de novo -- é a placa de som ainda sendo liberada pelo processo anterior.
 - Se o `setup_kits.py` falhar num dos 3 kits (ex: queda de internet no meio do download), roda de novo -- ele pula os kits que já montaram certo e só refaz o que faltou.
 - "pasta do kit não existe" ao trocar de kit pelo console: o `setup_kits.py` ainda não rodou (ou falhou) pro kit escolhido -- confere `kits.json` e roda `python3 setup_kits.py --only <kit>`.
+- Valores estranhos ("undefined"/vazios) na aba GLOBAL, ou parâmetros que parecem não ter sido salvos de verdade: clique **"Sincronizar agora"** na aba SISTEMA (ou na própria aba GLOBAL) -- força reler tudo do ESP32 agora. O backend já tenta se sincronizar sozinho ao subir (com várias tentativas, pra dar tempo do ESP32 terminar de reiniciar), mas esse botão resolve na hora se algo ainda ficou desatualizado.
+- **Raspberry não aparece mais na rede depois de ficar dias desligado** (mas continua acessível ligando um cabo de rede direto nele): provavelmente o Wi-Fi "esqueceu" a rede salva -- causa mais comum é ter desligado tirando o plugue da tomada direto, em vez de um desligamento correto (`sudo shutdown -h now`, esperando o LED verde parar de piscar antes de tirar da tomada), o que pode corromper o arquivo de configuração do Wi-Fi no cartão SD (o do cabo raramente é afetado, por isso só o Wi-Fi some). Pra confirmar e resolver, com o cabo de rede plugado:
+  ```
+  ip -brief addr           # confirma: eth0 com IP, wlan0 "DOWN" ou sem IP
+  nmcli connection show    # confirma: só aparece a conexão do cabo, nenhuma de Wi-Fi
+  sudo nmcli device wifi list                                  # confere se a rede de casa aparece por perto
+  sudo nmcli device wifi connect "NOME_DA_REDE" password "SENHA"   # cadastra ela de novo
+  ip -brief addr           # confirma que wlan0 já tem IP -- aí pode tirar o cabo
+  ```
 
-## Alternativa: copiar um `~/DrumGizmo` já pronto de outro Pi
+## Alternativa: já tenho outro Raspberry com os kits prontos
 
-Se preferir não depender da internet na hora da instalação (ou quiser
-garantir bit-a-bit a mesma versão que já está tocando em outro Pi), dá
-pra pular o Passo 4 inteiro e só copiar a pasta `~/DrumGizmo` já pronta
-do Pi antigo pro novo:
+Esta seção só se aplica a quem já tem **outra** instalação deste
+projeto funcionando -- por exemplo, montando uma segunda unidade, ou
+trocando o cartão SD de um Raspberry que já tinha tudo pronto. **Se
+esta é a sua primeira instalação, ignore esta seção e siga pro Passo
+4 normalmente** (que baixa e monta os kits pela internet).
+
+Nesses casos, pra não depender da internet de novo (ou pra garantir
+bit-a-bit a mesma versão que já está funcionando na outra máquina),
+dá pra pular o Passo 4 inteiro e só copiar a pasta `~/DrumGizmo` já
+pronta de um Raspberry pro outro:
 
 ```
-# rodando isso NO RASPBERRY ATUAL (o de onde os kits estão vindo)
+# rodando isso NO RASPBERRY QUE JÁ TEM os kits prontos
 scp -r ~/DrumGizmo <usuario>@<ip-do-pi-novo>:~/
 ```
 
@@ -228,3 +347,25 @@ scp -r ~/DrumGizmo <usuario>@<ip-do-pi-novo>:~/
 Pi novo). Nesse caso o `kits.json` deste repositório já aponta pros
 caminhos certos por padrão, então não precisa editar nada -- só pula
 direto pro Passo 5.
+
+## Licença
+
+O código deste repositório (backend Python, firmware do ESP32,
+scripts de instalação/montagem de kit e o console web) é distribuído
+sob a **GNU General Public License v3.0 (ou, à sua escolha, qualquer
+versão posterior)** -- veja o arquivo [`LICENSE`](LICENSE) pro texto
+completo. Resumindo: qualquer um pode usar, estudar, modificar e
+redistribuir esse código, inclusive em versões modificadas, desde que
+mantenha a mesma licença e não feche o código de qualquer versão
+redistribuída.
+
+**Isso NÃO cobre as amostras de áudio dos kits de bateria** (Padrão/
+test-kit oficial do DrumGizmo, Ludwig Black Cortex, Crocell) -- elas
+nunca ficam neste repositório (ver "O que tem aqui" no topo) e
+continuam sob a licença original de quem as gravou/distribuiu; o
+`setup_kits.py` só baixa e reorganiza o que já está disponível
+publicamente por cada projeto de origem. Se for redistribuir este
+projeto publicamente, confira a licença de cada kit na fonte
+original antes de incluir os `.wav` prontos junto (o mais seguro,
+que é o que este repositório já faz, é deixar o `setup_kits.py`
+baixar tudo na hora da instalação, em vez de empacotar os `.wav`).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * ================================================================
  * BATERIA ELETRÔNICA COM ESP32
@@ -12,20 +13,43 @@
  * (F0 7D 'D' 'R' texto F7) para não se misturar com as notas MIDI
  * de verdade (que continuam sendo bytes 0x90/0x80 crus, como antes).
  *
- * Comandos aceitos agora (o resto -- PAD/GLOBAL/CAL -- ainda não
- * está implementado neste firmware; ver aviso no README):
+ * Comandos aceitos agora (CAL/CALOFF -- streaming ao vivo do piezo
+ * pra calibração -- ainda não implementado neste firmware):
  *   PING                                        -> PONG
- *   GET                                         -> BEGINCONFIG, HH,..., HHSW,..., ENDCONFIG
- *   HH <ativo> <tipo> <aberto> <fechado> <filtro> <invertido>
+ *   GET                                         -> BEGINCONFIG, GLOBAL,..., HH,..., HHSW,...,
+ *                                                   PAD,0,..  PAD,7,.. (um por pad), ENDCONFIG
+ *   HH <ativo> <tipo> <aberto> <fechado> <filtro> <invertido> [<limiarMeioAberto> <limiarFechado>]
+ *                                                -> os 2 últimos parâmetros são opcionais
+ *                                                   (retrocompatível com consoles antigos de 6
+ *                                                   parâmetros); se omitidos, os limiares atuais
+ *                                                   não mudam.
  *   HHSW <ativo> <invertido> <forcar_fechado>
  *   HHSTATUS                                    -> HHSTATUS,<raw>,<posicao>,<switch>,<tipo>,<potRaw>
- *   SAVE                                        -> grava HH/HHSW na memória interna (sobrevive a reiniciar)
- *   RESET                                       -> volta HH/HHSW pros valores padrão
+ *   PAD <idx 0-7> <nota> <threshold> <velmax> <lockout> <ativo> <curva 0-2>
+ *                                                -> configura um pad (threshold/vel.máxima/
+ *                                                   bloqueio/ativo/curva de velocidade -- curva:
+ *                                                   0=Linear, 1=Exponencial, 2=Logarítmica). A
+ *                                                   nota também pode ser trocada aqui -- é como a
+ *                                                   "definição manual" (MIDI-learn) do console
+ *                                                   reatribui qual peça física manda qual nota.
+ *   GLOBAL <peak_time_ms> <min_velocity> <note_duration_ms> <midi_channel 1-16>
+ *   SAVE                                        -> grava tudo (HH/HHSW/PAD/GLOBAL) na memória
+ *                                                   interna (sobrevive a reiniciar)
+ *   RESET                                       -> volta tudo pros valores padrão de fábrica
  *
  * Além disso, o firmware agora detecta sozinho o "pedal chick": toda
  * vez que o hi-hat passa de aberto pra fechado (pelo sensor contínuo
  * ou pelo microswitch, o que estiver ativo), dispara a nota 44 (ver
  * verificarPedalChick()), sem precisar bater no pad com a baqueta.
+ *
+ * Zonas do sensor contínuo do Hi-Hat (potenciômetro, posição 0-127):
+ * agora são 3 zonas em vez de 2 -- ABERTO (nota 46), MEIO-ABERTO
+ * (nota 80) e FECHADO (nota 42) -- ver escolherNotaHiHat(). Os dois
+ * limiares que dividem essas zonas (hhLimiarMeioAberto/hhLimiarFechado)
+ * são configuráveis pelo console web e persistem na memória interna
+ * (Preferences), igual o resto da config do Hi-Hat. Com o microswitch
+ * ativo, a decisão continua sendo binária (só ABERTO/FECHADO), já que
+ * o switch não tem posição intermediária.
  * ================================================================
  */
 
@@ -35,13 +59,39 @@
 
 
 // ================================================================
-// VARIÁVEIS DOS PADS (igual antes)
+// VARIÁVEIS DOS PADS (detecção de batida -- igual antes)
 // ================================================================
 
 bool detectandoBatida[NUM_PADS] = {false};
 unsigned long tempoInicioLeitura[NUM_PADS] = {0};
 unsigned long tempoUltimaBatida[NUM_PADS] = {0};
 int picoValor[NUM_PADS] = {0};
+
+
+// ================================================================
+// CONFIGURAÇÃO POR PAD (configurável via console web / comando PAD,
+// persistida na memória interna do ESP32 -- ver
+// carregarConfigPads()/salvarConfigPads()/resetarConfigPads())
+// ================================================================
+
+int padNota[NUM_PADS];
+int padThreshold[NUM_PADS];
+int padVelMax[NUM_PADS];
+int padLockout[NUM_PADS];
+bool padAtivo[NUM_PADS];
+int padCurva[NUM_PADS];  // 0=Linear, 1=Exponencial, 2=Logarítmica
+
+
+// ================================================================
+// CONFIGURAÇÃO GLOBAL (configurável via console web / comando
+// GLOBAL, persistida na memória interna do ESP32 -- ver
+// carregarConfigGlobal()/salvarConfigGlobal()/resetarConfigGlobal())
+// ================================================================
+
+int globalPeakTime = GLOBAL_TEMPO_ESPERA_PICO_MS_PADRAO;
+int globalMinVelocity = GLOBAL_VELOCIDADE_MINIMA_PADRAO;
+int globalNoteDuration = GLOBAL_NOTE_DURATION_MS_PADRAO;
+int globalMidiChannel = GLOBAL_MIDI_CHANNEL_PADRAO;  // 1-16
 
 
 // ================================================================
@@ -58,6 +108,9 @@ bool hhInvertido = HH_INVERTIDO_PADRAO;
 bool hhswAtivo = HHSW_ATIVO_PADRAO;
 bool hhswInvertido = HHSW_INVERTIDO_PADRAO;
 bool hhswForcarFechado = HHSW_FORCAR_FECHADO_PADRAO;
+
+int hhLimiarMeioAberto = HH_LIMIAR_MEIO_ABERTO_PADRAO;  // posição 0-127 -- início do "meio-aberto"
+int hhLimiarFechado = HH_LIMIAR_FECHADO_PADRAO;         // posição 0-127 -- início do "fechado"
 
 int hhRawAtual = -1;        // último valor bruto lido (ADC ou mm) -- -1 = sem leitura
 int hhPosicaoAtual = -1;    // 0-127 normalizado (-1 = sem leitura válida)
@@ -86,6 +139,97 @@ void setup() {
   pinMode(GPIO_HIHAT_SWITCH, INPUT_PULLUP);  // pressionado = LOW
 
   carregarConfigHiHat();
+  carregarConfigPads();
+  carregarConfigGlobal();
+}
+
+
+// ================================================================
+// CONFIGURAÇÃO POR PAD -- carregar/salvar/resetar (memória interna
+// do ESP32). Cada pad usa 6 chaves próprias ("p0n".."p7c", nomes
+// curtos porque o Preferences só aceita até 15 caracteres de chave).
+// ================================================================
+
+void carregarConfigPads() {
+  prefs.begin("pads", true);  // true = somente leitura
+
+  for (int i = 0; i < NUM_PADS; i++) {
+    String p = "p" + String(i);
+    padNota[i] = prefs.getInt((p + "n").c_str(), NOTAS_MIDI[i]);
+    padThreshold[i] = prefs.getInt((p + "t").c_str(), LIMIAR_POR_PINO[i]);
+    padVelMax[i] = prefs.getInt((p + "v").c_str(), VELOCIDADE_MAXIMA_POR_PINO[i]);
+    padLockout[i] = prefs.getInt((p + "l").c_str(), BLOQUEIO_POR_PINO[i]);
+    padAtivo[i] = prefs.getBool((p + "a").c_str(), true);
+    padCurva[i] = prefs.getInt((p + "c").c_str(), 0);  // 0 = Linear
+  }
+
+  prefs.end();
+}
+
+void salvarConfigPads() {
+  prefs.begin("pads", false);  // false = leitura/escrita
+
+  for (int i = 0; i < NUM_PADS; i++) {
+    String p = "p" + String(i);
+    prefs.putInt((p + "n").c_str(), padNota[i]);
+    prefs.putInt((p + "t").c_str(), padThreshold[i]);
+    prefs.putInt((p + "v").c_str(), padVelMax[i]);
+    prefs.putInt((p + "l").c_str(), padLockout[i]);
+    prefs.putBool((p + "a").c_str(), padAtivo[i]);
+    prefs.putInt((p + "c").c_str(), padCurva[i]);
+  }
+
+  prefs.end();
+}
+
+void resetarConfigPads() {
+  for (int i = 0; i < NUM_PADS; i++) {
+    padNota[i] = NOTAS_MIDI[i];
+    padThreshold[i] = LIMIAR_POR_PINO[i];
+    padVelMax[i] = VELOCIDADE_MAXIMA_POR_PINO[i];
+    padLockout[i] = BLOQUEIO_POR_PINO[i];
+    padAtivo[i] = true;
+    padCurva[i] = 0;
+  }
+
+  salvarConfigPads();
+}
+
+
+// ================================================================
+// CONFIGURAÇÃO GLOBAL -- carregar/salvar/resetar (memória interna
+// do ESP32)
+// ================================================================
+
+void carregarConfigGlobal() {
+  prefs.begin("global", true);  // true = somente leitura
+
+  globalPeakTime = prefs.getInt("peakTime", GLOBAL_TEMPO_ESPERA_PICO_MS_PADRAO);
+  globalMinVelocity = prefs.getInt("minVel", GLOBAL_VELOCIDADE_MINIMA_PADRAO);
+  globalNoteDuration = prefs.getInt("noteDur", GLOBAL_NOTE_DURATION_MS_PADRAO);
+  globalMidiChannel = prefs.getInt("midiCh", GLOBAL_MIDI_CHANNEL_PADRAO);
+
+  prefs.end();
+}
+
+void salvarConfigGlobal() {
+  prefs.begin("global", false);  // false = leitura/escrita
+
+  prefs.putInt("peakTime", globalPeakTime);
+  prefs.putInt("minVel", globalMinVelocity);
+  prefs.putInt("noteDur", globalNoteDuration);
+  prefs.putInt("midiCh", globalMidiChannel);
+
+  prefs.end();
+}
+
+void resetarConfigGlobal() {
+  globalPeakTime = GLOBAL_TEMPO_ESPERA_PICO_MS_PADRAO;
+  globalMinVelocity = GLOBAL_VELOCIDADE_MINIMA_PADRAO;
+  globalNoteDuration = GLOBAL_NOTE_DURATION_MS_PADRAO;
+  globalMidiChannel = GLOBAL_MIDI_CHANNEL_PADRAO;
+
+  salvarConfigGlobal();
 }
 
 
@@ -109,7 +253,12 @@ void carregarConfigHiHat() {
   hhswInvertido = prefs.getBool("swInv", HHSW_INVERTIDO_PADRAO);
   hhswForcarFechado = prefs.getBool("swForcar", HHSW_FORCAR_FECHADO_PADRAO);
 
+  hhLimiarMeioAberto = prefs.getInt("hhLimMA", HH_LIMIAR_MEIO_ABERTO_PADRAO);
+  hhLimiarFechado = prefs.getInt("hhLimF", HH_LIMIAR_FECHADO_PADRAO);
+
   prefs.end();
+
+  corrigirOrdemLimiaresHiHat();
 }
 
 void salvarConfigHiHat() {
@@ -126,6 +275,9 @@ void salvarConfigHiHat() {
   prefs.putBool("swInv", hhswInvertido);
   prefs.putBool("swForcar", hhswForcarFechado);
 
+  prefs.putInt("hhLimMA", hhLimiarMeioAberto);
+  prefs.putInt("hhLimF", hhLimiarFechado);
+
   prefs.end();
 }
 
@@ -141,7 +293,31 @@ void resetarConfigHiHat() {
   hhswInvertido = HHSW_INVERTIDO_PADRAO;
   hhswForcarFechado = HHSW_FORCAR_FECHADO_PADRAO;
 
+  hhLimiarMeioAberto = HH_LIMIAR_MEIO_ABERTO_PADRAO;
+  hhLimiarFechado = HH_LIMIAR_FECHADO_PADRAO;
+
   salvarConfigHiHat();
+}
+
+// Garante hhLimiarMeioAberto < hhLimiarFechado -- se algum comando HH
+// mandar os dois valores invertidos (por engano ou versão antiga do
+// console), corrige em vez de deixar o hi-hat com lógica quebrada.
+void corrigirOrdemLimiaresHiHat() {
+  if (hhLimiarMeioAberto >= hhLimiarFechado) {
+    int tmp = hhLimiarMeioAberto;
+    hhLimiarMeioAberto = hhLimiarFechado;
+    hhLimiarFechado = tmp;
+  }
+  if (hhLimiarMeioAberto == hhLimiarFechado) {
+    // Empatados (ex: os dois em 0, ou os dois em 127) -- abre um espaço
+    // mínimo de 1 entre eles, preferindo subir o "fechado"; só desce o
+    // "meio-aberto" se o "fechado" já estiver no teto (127).
+    if (hhLimiarFechado < 127) {
+      hhLimiarFechado++;
+    } else {
+      hhLimiarMeioAberto--;
+    }
+  }
 }
 
 
@@ -240,8 +416,9 @@ void atualizarHiHat() {
 
   hhUltimaPosicaoEnviada = hhPosicaoAtual;
 
-  Serial.write(0xB0);  // Control Change - canal 1
-  Serial.write(4);     // CC4 - Foot Controller
+  byte canal = constrain(globalMidiChannel, 1, 16) - 1;  // mesmo canal configurado em GLOBAL
+  Serial.write(0xB0 | canal);  // Control Change
+  Serial.write(4);             // CC4 - Foot Controller
   Serial.write(hhPosicaoAtual);
 }
 
@@ -275,7 +452,44 @@ bool hihatEstaFechado() {
     return true;  // sem leitura válida -- assume fechado por segurança
   }
 
-  return hhPosicaoAtual >= HIHAT_LIMIAR_FECHADO;
+  return hhPosicaoAtual >= hhLimiarFechado;
+}
+
+
+// ================================================================
+// ESCOLHE A NOTA DO HI-HAT QUANDO O PAD É ATINGIDO
+// ================================================================
+//
+// Com microswitch ativo, continua sendo uma decisão binária (usa
+// hihatEstaFechado(), igual antes -- o microswitch não tem posição
+// intermediária). Com o sensor contínuo (potenciômetro), agora são
+// 3 zonas em vez de 2, usando hhLimiarMeioAberto/hhLimiarFechado
+// (configuráveis pelo console web):
+//
+//   posição >= hhLimiarFechado                          -> FECHADO (42)
+//   posição >= hhLimiarMeioAberto (e < hhLimiarFechado)  -> MEIO-ABERTO (80)
+//   posição <  hhLimiarMeioAberto                        -> ABERTO (46)
+//
+
+int escolherNotaHiHat() {
+
+  if (hhswAtivo) {
+    return hihatEstaFechado() ? NOTA_HIHAT_FECHADO : NOTA_HIHAT_ABERTO;
+  }
+
+  if (!hhAtivo || hhPosicaoAtual < 0) {
+    return NOTA_HIHAT_FECHADO;  // sem leitura válida -- padrão seguro (igual hihatEstaFechado())
+  }
+
+  if (hhPosicaoAtual >= hhLimiarFechado) {
+    return NOTA_HIHAT_FECHADO;
+  }
+
+  if (hhPosicaoAtual >= hhLimiarMeioAberto) {
+    return NOTA_HIHAT_MEIO_ABERTO;
+  }
+
+  return NOTA_HIHAT_ABERTO;
 }
 
 
@@ -307,57 +521,57 @@ void verificarPedalChick() {
 
 
 // ================================================================
-// CURVA DE VELOCIDADE (igual antes)
+// CURVA DE VELOCIDADE -- 3 curvas de verdade agora (configurável por
+// pad, comando PAD/campo "curva"), em vez do ajuste fixo que só
+// existia pro Bumbo/Caixa antes:
+//
+//   0 = Linear       -- não mexe na velocidade medida.
+//   1 = Exponencial  -- acentua a diferença entre fraco/forte (pancada
+//                       fraca fica mais fraca ainda, forte fica perto
+//                       do máximo).
+//   2 = Logarítmica  -- o contrário: realça pancadas fracas, "achata"
+//                       as fortes (mais fácil tocar suave e ainda
+//                       ouvir bem).
 // ================================================================
 
 int aplicarCurva(int padIndex, int velocidade) {
 
-  if (!CURVA_ATIVA_POR_PINO[padIndex]) {
-    return velocidade;
+  int curva = padCurva[padIndex];
+
+  if (curva == 0 || velocidade <= 0) {
+    return velocidade;  // Linear -- sem alteração
   }
 
-  int nota = NOTAS_MIDI[padIndex];
+  float norm = velocidade / 127.0;
+  float k = 2.0;  // intensidade da curva
 
-  if (nota == 36) {  // BUMBO
-    if (velocidade < 20) {
-      return 0;
-    }
-    return velocidade;
-  }
+  float resultado = (curva == 1) ? pow(norm, k) : pow(norm, 1.0 / k);
 
-  if (nota == 38) {  // CAIXA
-    if (velocidade < 30) {
-      return velocidade * 0.9;
-    }
-    if (velocidade < 80) {
-      return velocidade * 1.1;
-    }
-    return velocidade;
-  }
-
-  return velocidade;
+  int v = (int)round(resultado * 127.0);
+  return constrain(v, 1, 127);
 }
 
 
 // ================================================================
-// ENVIA NOTA MIDI (igual antes)
+// ENVIA NOTA MIDI -- respeita o canal MIDI configurável (GLOBAL)
 // ================================================================
 
 void enviarMIDI(int nota, int velocidade) {
 
-  if (velocidade < VELOCIDADE_MINIMA) {
+  if (velocidade < globalMinVelocity) {
     return;
   }
 
   velocidade = constrain(velocidade, 1, 127);
+  byte canal = constrain(globalMidiChannel, 1, 16) - 1;  // 1-16 na tela -> 0-15 de verdade
 
-  Serial.write(0x90);
+  Serial.write(0x90 | canal);
   Serial.write(nota);
   Serial.write(velocidade);
 
-  delay(NOTE_DURATION_MS);
+  delay(globalNoteDuration);
 
-  Serial.write(0x80);
+  Serial.write(0x80 | canal);
   Serial.write(nota);
   Serial.write(0);
 }
@@ -371,10 +585,14 @@ void processarPads() {
 
   for (int i = 0; i < NUM_PADS; i++) {
 
+    if (!padAtivo[i]) {
+      continue;  // pad desativado (comando PAD, campo "ativo") -- nem lê nem dispara
+    }
+
     int valor = analogRead(GPIO_PADS[i]);
-    int limiar = LIMIAR_POR_PINO[i];
-    int bloqueioMs = BLOQUEIO_POR_PINO[i];
-    int velMax = VELOCIDADE_MAXIMA_POR_PINO[i];
+    int limiar = padThreshold[i];
+    int bloqueioMs = padLockout[i];
+    int velMax = padVelMax[i];
 
     if (!detectandoBatida[i] && valor > limiar) {
       if (millis() - tempoUltimaBatida[i] > bloqueioMs) {
@@ -390,25 +608,25 @@ void processarPads() {
         picoValor[i] = valor;
       }
 
-      if (millis() - tempoInicioLeitura[i] > TEMPO_ESPERA_PICO_MS) {
+      if (millis() - tempoInicioLeitura[i] > globalPeakTime) {
 
         detectandoBatida[i] = false;
         tempoUltimaBatida[i] = millis();
 
         if (picoValor[i] > limiar) {
 
-          int velocidade = map(picoValor[i], limiar, velMax, VELOCIDADE_MINIMA, 127);
-          velocidade = constrain(velocidade, VELOCIDADE_MINIMA, 127);
+          int velocidade = map(picoValor[i], limiar, velMax, globalMinVelocity, 127);
+          velocidade = constrain(velocidade, globalMinVelocity, 127);
           velocidade = aplicarCurva(i, velocidade);
 
           // ------------------------------------------------
           // ESCOLHE A NOTA (Hi-Hat depende do sensor/switch ativo)
           // ------------------------------------------------
 
-          int nota = NOTAS_MIDI[i];
+          int nota = padNota[i];
 
           if (i == HIHAT_PAD_INDEX) {
-            nota = hihatEstaFechado() ? NOTA_HIHAT_FECHADO : NOTA_HIHAT_ABERTO;
+            nota = escolherNotaHiHat();
           }
 
           if (velocidade > 0) {
@@ -456,7 +674,9 @@ String formatarHH() {
   s += String(hhAberto); s += ",";
   s += String(hhFechado); s += ",";
   s += String(hhFiltro); s += ",";
-  s += (hhInvertido ? "1" : "0");
+  s += (hhInvertido ? "1" : "0"); s += ",";
+  s += String(hhLimiarMeioAberto); s += ",";
+  s += String(hhLimiarFechado);
   return s;
 }
 
@@ -465,6 +685,27 @@ String formatarHHSW() {
   s += (hhswAtivo ? "1" : "0"); s += ",";
   s += (hhswInvertido ? "1" : "0"); s += ",";
   s += (hhswForcarFechado ? "1" : "0");
+  return s;
+}
+
+String formatarPad(int idx) {
+  String s = "PAD,";
+  s += String(idx); s += ",";
+  s += String(padNota[idx]); s += ",";
+  s += String(padThreshold[idx]); s += ",";
+  s += String(padVelMax[idx]); s += ",";
+  s += String(padLockout[idx]); s += ",";
+  s += (padAtivo[idx] ? "1" : "0"); s += ",";
+  s += String(padCurva[idx]);
+  return s;
+}
+
+String formatarGlobal() {
+  String s = "GLOBAL,";
+  s += String(globalPeakTime); s += ",";
+  s += String(globalMinVelocity); s += ",";
+  s += String(globalNoteDuration); s += ",";
+  s += String(globalMidiChannel);
   return s;
 }
 
@@ -544,20 +785,35 @@ void processarComando(String linha) {
 
   if (cmd == "GET") {
     enviarResposta("BEGINCONFIG");
+    enviarResposta(formatarGlobal());
     enviarResposta(formatarHH());
     enviarResposta(formatarHHSW());
+    for (int i = 0; i < NUM_PADS; i++) {
+      enviarResposta(formatarPad(i));
+    }
     enviarResposta("ENDCONFIG");
     return;
   }
 
   if (cmd == "HH") {
-    if (contarTokens(linha) >= 7) {
+    // Formato novo (9 tokens: "HH" + 8 parâmetros) já inclui os dois
+    // limiares novos; formato antigo (7 tokens: "HH" + 6 parâmetros,
+    // consoles/scripts desatualizados) continua aceito, só sem mexer
+    // nos limiares (mantém o que já estava configurado).
+    int tokens = contarTokens(linha);
+    if (tokens >= 7) {
       hhAtivo = tokenInt(linha, 1) != 0;
       hhTipo = tokenInt(linha, 2);
       hhAberto = tokenInt(linha, 3);
       hhFechado = tokenInt(linha, 4);
       hhFiltro = tokenInt(linha, 5);
       hhInvertido = tokenInt(linha, 6) != 0;
+
+      if (tokens >= 9) {
+        hhLimiarMeioAberto = tokenInt(linha, 7);
+        hhLimiarFechado = tokenInt(linha, 8);
+        corrigirOrdemLimiaresHiHat();
+      }
 
       enviarResposta(formatarHH());
       enviarResposta("OK,HH");
@@ -586,22 +842,70 @@ void processarComando(String linha) {
     return;
   }
 
+  if (cmd == "PAD") {
+    // "PAD" + 7 parâmetros (idx nota threshold velmax lockout ativo
+    // curva) = 8 tokens.
+    if (contarTokens(linha) >= 8) {
+      int idx = tokenInt(linha, 1);
+
+      if (idx < 0 || idx >= NUM_PADS) {
+        enviarResposta("ERROR,PAD");
+        return;
+      }
+
+      padNota[idx] = tokenInt(linha, 2);
+      padThreshold[idx] = tokenInt(linha, 3);
+      padVelMax[idx] = tokenInt(linha, 4);
+      padLockout[idx] = tokenInt(linha, 5);
+      padAtivo[idx] = tokenInt(linha, 6) != 0;
+      padCurva[idx] = constrain((int)tokenInt(linha, 7), 0, 2);
+
+      enviarResposta(formatarPad(idx));
+      enviarResposta("OK,PAD");
+    } else {
+      enviarResposta("ERROR,PAD");
+    }
+    return;
+  }
+
+  if (cmd == "GLOBAL") {
+    // "GLOBAL" + 4 parâmetros (peak_time min_velocity note_duration
+    // midi_channel) = 5 tokens.
+    if (contarTokens(linha) >= 5) {
+      globalPeakTime = max(1, (int)tokenInt(linha, 1));
+      globalMinVelocity = constrain((int)tokenInt(linha, 2), 0, 127);
+      globalNoteDuration = max(1, (int)tokenInt(linha, 3));
+      globalMidiChannel = constrain((int)tokenInt(linha, 4), 1, 16);
+
+      enviarResposta(formatarGlobal());
+      enviarResposta("OK,GLOBAL");
+    } else {
+      enviarResposta("ERROR,GLOBAL");
+    }
+    return;
+  }
+
   if (cmd == "SAVE") {
     salvarConfigHiHat();
+    salvarConfigPads();
+    salvarConfigGlobal();
     enviarResposta("OK,SAVE");
     return;
   }
 
   if (cmd == "RESET") {
     resetarConfigHiHat();
+    resetarConfigPads();
+    resetarConfigGlobal();
     enviarResposta("OK,RESET");
     return;
   }
 
-  // PAD / GLOBAL / CAL / CALOFF: ainda não implementados neste
-  // firmware (só a parte do Hi-Hat foi feita até agora) -- responde
-  // um erro explícito em vez de ficar quieto, pra ficar claro no
-  // console que esse comando não teve efeito nenhum.
+  // CAL / CALOFF: ainda não implementados neste firmware (streaming
+  // ao vivo do valor bruto do piezo pra calibração -- diferente do
+  // PAD, que só grava/lê os parâmetros já definidos) -- responde um
+  // erro explícito em vez de ficar quieto, pra ficar claro no console
+  // que esse comando não teve efeito nenhum.
   enviarResposta("ERROR,UNKNOWN");
 }
 

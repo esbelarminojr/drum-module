@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * ================================================================
  * CONFIG_BATERIA.H
@@ -209,18 +210,31 @@ const bool HHSW_FORCAR_FECHADO_PADRAO = false;
 
 
 // ================================================================
-// LIMIAR DE DECISÃO ABERTO/FECHADO (posição normalizada 0-127)
+// LIMIARES DE DECISÃO ABERTO / MEIO-ABERTO / FECHADO
+// (posição normalizada 0-127, 0=aberto, 127=fechado, já
+// considerando "invertido")
 // ================================================================
 //
 // Quando o pad do Hi-Hat é atingido (e o microswitch não está
-// ativo), comparamos a posição normalizada (0=aberto, 127=fechado,
-// já considerando "invertido") com esse limiar pra escolher a nota:
+// ativo), comparamos a posição normalizada com esses dois limiares
+// pra escolher a nota (ver escolherNotaHiHat() no .ino):
 //
-//   posição >= HIHAT_LIMIAR_FECHADO  -> nota de fechado
-//   posição <  HIHAT_LIMIAR_FECHADO  -> nota de aberto
+//   posição >= hhLimiarFechado                          -> nota de fechado
+//   posição >= hhLimiarMeioAberto (e < hhLimiarFechado)  -> nota de meio-aberto
+//   posição <  hhLimiarMeioAberto                        -> nota de aberto
+//
+// Esses dois valores são configuráveis em tempo real pelo console
+// web (comando HH) e ficam guardados na memória interna do ESP32
+// (Preferences), igual aberto/fechado/filtro/invertido. Os valores
+// abaixo são só o padrão de fábrica, usados na primeira vez que o
+// ESP32 liga.
+//
+// hhLimiarMeioAberto precisa ficar SEMPRE menor que hhLimiarFechado
+// -- o firmware corrige automaticamente se vier invertido por engano.
 //
 
-const int HIHAT_LIMIAR_FECHADO = 64;
+const int HH_LIMIAR_MEIO_ABERTO_PADRAO = 40;
+const int HH_LIMIAR_FECHADO_PADRAO = 100;
 
 
 // ================================================================
@@ -229,6 +243,7 @@ const int HIHAT_LIMIAR_FECHADO = 64;
 
 const int NOTA_HIHAT_FECHADO = 42;
 const int NOTA_HIHAT_ABERTO = 46;
+const int NOTA_HIHAT_MEIO_ABERTO = 80;
 
 
 // ================================================================
@@ -269,24 +284,35 @@ const unsigned long PEDAL_CHICK_BLOQUEIO_MS = 80; // ignora transições novas p
 
 
 // ================================================================
-// VELOCIDADE MÍNIMA
+// VALORES PADRÃO -- GLOBAL (agora configurável em tempo real pelo
+// console web/comando GLOBAL, e persistido na memória interna do
+// ESP32, igual o Hi-Hat -- estes aqui são só o padrão de fábrica)
 // ================================================================
 
-const int VELOCIDADE_MINIMA = 5;
-
-
-// ================================================================
-// TEMPO PARA ENCONTRAR O PICO DO PIEZO
-// ================================================================
-
-const int TEMPO_ESPERA_PICO_MS = 30;
+const int GLOBAL_VELOCIDADE_MINIMA_PADRAO = 5;
+const int GLOBAL_TEMPO_ESPERA_PICO_MS_PADRAO = 30;
+const int GLOBAL_NOTE_DURATION_MS_PADRAO = 3;
+const int GLOBAL_MIDI_CHANNEL_PADRAO = 1;  // 1-16 (igual a tela mostra) -- 1 = canal MIDI 0 de verdade
 
 
 // ================================================================
-// DURAÇÃO DA NOTA MIDI
+// VALORES PADRÃO -- PARÂMETROS POR PAD (threshold/vel.máxima/
+// bloqueio/ativo/curva -- também configuráveis em tempo real pelo
+// console web/comando PAD, e persistidos igual o resto. Os arrays
+// LIMIAR_POR_PINO / VELOCIDADE_MAXIMA_POR_PINO / BLOQUEIO_POR_PINO /
+// CURVA_ATIVA_POR_PINO acima continuam existindo só como o padrão de
+// fábrica usado a primeira vez que o ESP32 liga -- depois disso, quem
+// manda são as variáveis padThreshold/padVelMax/padLockout/padAtivo/
+// padCurva/padNota, carregadas da memória interna.
 // ================================================================
-
-const int NOTE_DURATION_MS = 3;
+//
+// Curva de velocidade (padCurva, 0/1/2 -- ver escolherCurva() no
+// .ino): 0 = Linear (não mexe na velocidade medida), 1 = Exponencial
+// (acentua a diferença entre pancada fraca/forte -- fraca fica mais
+// fraca ainda, forte fica perto do máximo), 2 = Logarítmica (o
+// contrário -- realça pancadas fracas, "achata" as fortes). Todos os
+// pads começam em Linear (0) por padrão.
+//
 
 
 // ================================================================

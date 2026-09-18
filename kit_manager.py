@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 kit_manager.py
 ================================================================
@@ -168,6 +169,66 @@ def resolve_alsa_device(data=None):
     return None
 
 
+def _set_usb_mixer_max():
+    """
+    Sobe os controles de volume da placa de som USB (PCM/Master/
+    Speaker/Headphone/Playback, o que existir) pro máximo, e desmuta
+    -- toda vez que um kit é iniciado.
+
+    Por quê: a placa de som USB não tem NVRAM própria com "o volume que
+    eu deixei ontem" -- depois de reiniciar o Raspberry, o ALSA volta a
+    placa pro que estiver salvo em /var/lib/alsa/asound.state (se
+    alguém rodou 'alsactl store' alguma vez) ou, se nunca foi salvo,
+    pro padrão de fábrica da placa -- e nenhum dos dois garante estar
+    no máximo. Isso já causou volume geral mais baixo depois de um
+    reboot, com a interface web mostrando tudo "no máximo" mesmo assim
+    -- porque o que a interface/ESP32 controlam é a intensidade do
+    toque (velocity), não esse ganho analógico de saída da placa, que
+    fica numa camada totalmente separada (ALSA/hardware).
+
+    Em vez de depender de 'alsactl store' ter sido rodado uma vez (e
+    ficar torcendo pra continuar valendo depois de trocar de placa/Pi),
+    a correção sai daqui: garante o volume máximo sozinho toda vez que
+    um kit sobe, em qualquer placa USB, sem precisar configurar nada.
+    Melhor esforço só -- se não achar exatamente 1 placa USB, ou o
+    'amixer' falhar por qualquer motivo, não impede o kit de iniciar,
+    só avisa no log.
+    """
+    cards = detect_usb_audio_cards()
+    if len(cards) != 1:
+        return  # 0 ou >1 placas: mesma ambiguidade de resolve_alsa_device, não arrisca adivinhar
+
+    idx = cards[0]["index"]
+    try:
+        out = subprocess.run(
+            ["amixer", "-c", str(idx), "scontrols"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        print(f"[kit_manager] aviso: não consegui listar os controles de mixer da placa {idx} ({e}) -- volume de saída não ajustado.")
+        return
+
+    nomes = re.findall(r"'([^']+)'", out.stdout or "")
+    alvo_substrings = ("pcm", "speaker", "master", "headphone", "playback")
+    ajustados = []
+    for nome in nomes:
+        if not any(s in nome.lower() for s in alvo_substrings):
+            continue  # ignora controles que não parecem de volume de saída (ex: switches de captura/ganho de mic)
+        try:
+            subprocess.run(
+                ["amixer", "-c", str(idx), "sset", nome, "100%", "unmute"],
+                capture_output=True, text=True, timeout=5,
+            )
+            ajustados.append(nome)
+        except Exception:
+            pass  # melhor esforço -- um controle que não aceita esse formato não deve travar o início do kit
+
+    if ajustados:
+        print(f"[kit_manager] volume de saída da placa USB (card {idx}) ajustado pro máximo: {', '.join(ajustados)}")
+    else:
+        print(f"[kit_manager] aviso: nenhum controle de volume reconhecido na placa USB (card {idx}) -- confira com 'alsamixer -c {idx}' se o volume de saída está baixo.")
+
+
 def get_audio_device_status():
     """Pra tela de Configurações/Sistema: o que está salvo, o que
     realmente vai ser usado agora, e o que foi detectado nesta máquina."""
@@ -197,6 +258,26 @@ def set_audio_device(value):
 
 def get_active_kit():
     return _load().get("active")
+
+
+def get_active_kit_paths():
+    """Pra quem precisa saber ONDE estão os arquivos do kit tocando agora
+    (ex: apply_pad_pan.py, que precisa achar o .xml do instrumento) --
+    devolve None se o kit ativo não usar o formato 'cwd/kit_xml/midimap'
+    (ex: um kit configurado via 'launch_cmd' na unha)."""
+    data = _load()
+    name = data.get("active")
+    if not name:
+        return None
+    kit_cfg = data.get("kits", {}).get(name)
+    if not kit_cfg or "kit_xml" not in kit_cfg or not kit_cfg.get("midimap"):
+        return None
+    return {
+        "name": name,
+        "cwd": os.path.expanduser(os.path.expandvars(kit_cfg.get("cwd") or "")),
+        "kit_xml": kit_cfg["kit_xml"],
+        "midimap": kit_cfg["midimap"],
+    }
 
 
 def _stop_locked():
@@ -396,7 +477,7 @@ def _build_cmd(kit_cfg, alsa_device=None):
 
     1) formato novo (recomendado) -- pasta + nome dos arquivos:
        {
-         "cwd": "/home/ju/DrumGizmo/kits/kits/test",
+         "cwd": "/home/<usuario>/DrumGizmo/kits/kits/test",
          "kit_xml": "test.xml",
          "midimap": "midimap.xml"
        }
@@ -513,9 +594,10 @@ def start_kit(name, on_ready=None, on_progress=None):
     if kit_cfg.get("cwd"):
         # expande "~" (e variáveis tipo $HOME) pra funcionar em qualquer
         # máquina/usuário -- assim o kits.json pode usar "~/DrumGizmo/..."
-        # em vez de um caminho fixo tipo "/home/ju/DrumGizmo/...".
+        # em vez de um caminho fixo tipo "/home/<usuario>/DrumGizmo/...".
         kit_cfg["cwd"] = os.path.expanduser(os.path.expandvars(kit_cfg["cwd"]))
     alsa_device = resolve_alsa_device(data)
+    _set_usb_mixer_max()
     cmd = _build_cmd(kit_cfg, alsa_device=alsa_device)
     cwd = kit_cfg.get("cwd") or None
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 setup_kits.py
 ================================================================
@@ -44,7 +45,7 @@ DEFAULT_KITS_JSON = os.path.join(SCRIPT_DIR, "kits.json")
 
 SLIM_CROCELL = os.path.join(SCRIPT_DIR, "slim_crocell.py")
 BUILD_HIHAT_PEDAL = os.path.join(SCRIPT_DIR, "build_hihat_pedal_kit.py")
-NORMALIZE_LUDWIG = os.path.join(SCRIPT_DIR, "normalize_ludwig_v2.py")
+NORMALIZE_LUDWIG = os.path.join(SCRIPT_DIR, "normalize_ludwig.py")
 
 TEST_KIT_URL = "https://drumgizmo.org/kits/test-kit.tar.gz"
 LUDWIG_REPO_URL = "https://github.com/samuelsantanaoficial/drumgizmo-tchakpoum-ludwig-black-cortex.git"
@@ -232,10 +233,12 @@ def setup_crocell(kits_dir, force):
     crocell_root = os.path.join(kits_dir, "crocellkit")
     src_dir = os.path.join(crocell_root, "CrocellKit")
     final_dir = os.path.join(crocell_root, "CrocellKit_pi3")
-    final_xml = os.path.join(final_dir, "CrocellKit_tiny2_pi.xml")
+    # nome final depois de encadear DUAS adições ao "tiny" original (ver
+    # comentário mais abaixo): tiny -> tiny2 (+HihatPedal) -> tiny22 (+HihatSemiOpen)
+    final_xml = os.path.join(final_dir, "CrocellKit_tiny22_pi.xml")
     if os.path.isfile(final_xml) and not force:
         print(f"Crocell já está pronto em {final_dir} (use --force pra refazer). Pulando.")
-        return {"cwd": final_dir, "kit_xml": "CrocellKit_tiny2_pi.xml", "midimap": "Midimap_tiny2.xml"}
+        return {"cwd": final_dir, "kit_xml": "CrocellKit_tiny22_pi.xml", "midimap": "Midimap_tiny22.xml"}
 
     if force:
         for d in (src_dir, final_dir):
@@ -258,11 +261,32 @@ def setup_crocell(kits_dir, force):
         sys.exit(f"ERRO: esperava {full_orchestra!r} depois de extrair o CrocellKit1_1.zip -- "
                   "confira se a estrutura do pacote oficial mudou.")
 
+    # Encadeia duas passadas de build_hihat_pedal_kit.py (script genérico,
+    # recebe --instrumento/--nota como parâmetro -- não é hardcoded só pro
+    # HihatPedal): a 1a adiciona HihatPedal (nota 44, "pedal chick") em
+    # cima do "tiny" original, gerando "..._tiny2.xml"; a 2a adiciona
+    # HihatSemiOpen (nota 80, chimbal meio-aberto -- pedido feito depois
+    # de conferir os nomes reais no CrocellKit_full.xml/Midimap_full.xml
+    # deste kit) em cima do resultado da 1a, gerando "..._tiny22.xml". Cada
+    # passada só copia o instrumento inteiro (com os canais certos) do kit
+    # FULL pro tiny -- não inventa nada.
     tiny2_orchestra = os.path.join(src_dir, "CrocellKit_tiny2.xml")
     tiny2_midimap = os.path.join(src_dir, "Midimap_tiny2.xml")
     if not os.path.isfile(tiny2_orchestra) or not os.path.isfile(tiny2_midimap) or force:
         log("Crocell: adicionando instrumento HihatPedal (build_hihat_pedal_kit.py)")
         run([sys.executable, BUILD_HIHAT_PEDAL, src_dir])
+
+    tiny22_orchestra = os.path.join(src_dir, "CrocellKit_tiny22.xml")
+    tiny22_midimap = os.path.join(src_dir, "Midimap_tiny22.xml")
+    if not os.path.isfile(tiny22_orchestra) or not os.path.isfile(tiny22_midimap) or force:
+        log("Crocell: adicionando instrumento HihatSemiOpen (build_hihat_pedal_kit.py)")
+        run([
+            sys.executable, BUILD_HIHAT_PEDAL, src_dir,
+            "--tiny-orchestra", "CrocellKit_tiny2.xml",
+            "--tiny-midimap", "Midimap_tiny2.xml",
+            "--instrumento", "HihatSemiOpen",
+            "--nota", "80",
+        ])
 
     log("Crocell: reduzindo canais/camadas com slim_crocell.py (--keep-fraction 0.5)")
     with tempfile.NamedTemporaryFile(
@@ -275,13 +299,13 @@ def setup_crocell(kits_dir, force):
             sys.executable, SLIM_CROCELL,
             "--keep-fraction", "0.5",
             "--channel-map", channel_map_path,
-            src_dir, "CrocellKit_tiny2.xml", final_dir,
+            src_dir, "CrocellKit_tiny22.xml", final_dir,
         ])
     finally:
         os.remove(channel_map_path)
 
     print(f"Crocell pronto em {final_dir}")
-    return {"cwd": final_dir, "kit_xml": "CrocellKit_tiny2_pi.xml", "midimap": "Midimap_tiny2.xml"}
+    return {"cwd": final_dir, "kit_xml": "CrocellKit_tiny22_pi.xml", "midimap": "Midimap_tiny22.xml"}
 
 
 def update_kits_json(path, results):

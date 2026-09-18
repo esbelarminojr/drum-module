@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 ================================================================
  DRUM BACKEND -- ponte ESP32 <-> DrumGizmo <-> Console web (HTML)
@@ -49,11 +50,14 @@ Comandos que este processo manda pro ESP32 (texto, uma linha):
     SAVE
     RESET
     PAD <idx> <nota> <threshold> <velmax> <lockout> <ativo> <curva>
+        -- <idx> aqui é o índice FÍSICO do firmware (0-7, ver
+           PAD_ID_TO_FIRMWARE_IDX), já traduzido a partir do id que o
+           console web usa -- não confundir os dois.
     GLOBAL <peak> <minvel> <duration> <canal>
-    HH <ativo> <tipo> <aberto> <fechado> <filtro> <invertido>
+    HH <ativo> <tipo> <aberto> <fechado> <filtro> <invertido> [<limiarMeioAberto> <limiarFechado>]
     HHSW <ativo> <invertido> <forcar_fechado>
-    CAL <idx>
-    CALOFF
+    CAL <idx>              -- ainda não implementado no firmware (streaming ao vivo)
+    CALOFF                 -- idem
     HHSTATUS
 
 Respostas do ESP32 (sempre chegam encapsuladas em SysEx):
@@ -71,16 +75,17 @@ Respostas do ESP32 (sempre chegam encapsuladas em SysEx):
 ------------------------------------------------------------------
 IMPORTANTE -- suposição a validar:
 
-Assumi que o índice de pad 0..10 usado pelo ESP32 (mesma ordem do
-GET) corresponde, na mesma ordem, à lista PADS do HTML:
-
-    0 Bumbo, 1 Caixa, 2 Tom1, 3 Tom2, 4 Tom3, 5 Hi-Hat,
-    6 Crash, 7 Ride, 8 Splash, 9 China, 10 Tom4
-
-Isso bate com as notas MIDI padrão que já estavam no protótipo
-(36,38,48,45,43,42,49,51,55,52,37). Se na primeira sincronização
-(GET) as notas vierem em outra ordem, é só ajustar o mapeamento em
-`PAD_ORDER` abaixo -- o resto do backend não depende da ordem.
+RESOLVIDO (2026-09-18) -- a suposição original era ERRADA: o firmware
+físico (config_bateria.h: NOME_PADS/NOTAS_MIDI/GPIO_PADS) usa uma ordem
+DIFERENTE da lista PADS do console a partir do índice 5 -- o console
+lista Hi-Hat antes de Crash/Ride, mas o firmware físico tem o Hi-Hat
+por último (índice 7, GPIO dedicado). Ver PAD_ID_TO_FIRMWARE_IDX logo
+abaixo, que traduz entre as duas ordens em toda leitura/escrita de
+`pads` -- sem isso, editar "Hi-Hat" pela tela mandaria o comando PAD
+pro índice físico do Crash, silenciosamente. Os ids 8-10 do console
+(Splash/China/Tom4) não têm pad físico correspondente (o firmware só
+tem 8 pads) e continuam sem tradução -- ficam permanentemente como
+"pad não sincronizado".
 ================================================================
 """
 
@@ -96,6 +101,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_sock import Sock
 
 import kit_manager
+import pad_mixer
 
 # ----------------------------------------------------------------
 # CONFIGURAÇÃO
@@ -154,13 +160,42 @@ COMMAND_TIMEOUT = 1.2  # segundos de espera por ACK antes de considerar timeout
 # ESTADO COMPARTILHADO (cache do que o ESP32 já confirmou)
 # ----------------------------------------------------------------
 
-pads = {}            # idx(int) -> {nota, threshold, velmax, lockout, ativo, curva}
+pads = {}            # idx FÍSICO do firmware (int) -> {nota, threshold, velmax, lockout, ativo, curva}
 global_config = {}   # {peak_time, min_velocity, note_duration, midi_channel}
 hh_config = {}       # {ativo, tipo, aberto, fechado, filtro, invertido}
 hhsw_config = {}     # {ativo, invertido, forcar_fechado}
 hh_live = {}         # {raw, posicao, switch, tipo} -- última HHSTATUS recebida
 
 state_lock = threading.Lock()  # protege os dicts acima
+
+# ----------------------------------------------------------------
+# ORDEM DOS PADS -- o console web (lista PADS do HTML) e o firmware
+# físico (NOME_PADS/NOTAS_MIDI/GPIO_PADS em config_bateria.h) usam
+# ORDENS DIFERENTES a partir do índice 5: o HTML lista Hi-Hat antes de
+# Crash/Ride, mas o firmware físico tem Hi-Hat por último (índice 7,
+# GPIO dedicado). Confirmado batendo a nota MIDI de cada posição nas
+# duas listas (a mesma nota tem que estar no mesmo pad físico):
+#
+#   id no HTML -> índice físico no firmware
+#   0 Bumbo(36)->0   1 Caixa(38)->1   2 Tom1(48)->2   3 Tom2(45)->3
+#   4 Tom3(43)->4    5 Hi-Hat(42)->7  6 Crash(49)->5  7 Ride(51)->6
+#
+# Sem essa tradução, editar "Hi-Hat" pela tela mandaria o comando PAD
+# pro índice físico do Crash (e vice-versa) -- o ESP32 aceitaria sem
+# reclamar, então o bug ficaria silencioso. Índices 8-10 do HTML
+# (Splash/China/Tom4) não têm pad físico correspondente -- ficam sem
+# tradução (o backend já trata isso como "pad não sincronizado").
+# ----------------------------------------------------------------
+
+PAD_ID_TO_FIRMWARE_IDX = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 7, 6: 5, 7: 6}
+FIRMWARE_IDX_TO_PAD_ID = {v: k for k, v in PAD_ID_TO_FIRMWARE_IDX.items()}
+
+
+def _fw_idx(pad_id):
+    """Traduz o id do pad como o console mostra pro índice físico real
+    do firmware. ids sem pad físico (8-10) voltam sem tradução -- o
+    resto do código já trata esse caso como 'nunca vai sincronizar'."""
+    return PAD_ID_TO_FIRMWARE_IDX.get(pad_id, pad_id)
 
 esp32_connected = False  # vira True assim que a serial abre com sucesso
 
@@ -177,6 +212,28 @@ def enviar_midi(msg):
         midiout.send_message(msg)
     except Exception as e:
         print("[backend] erro MIDI:", e)
+
+
+def _aplicar_volume_pad(nota, velocity):
+    """Escala a velocity de um note-on pelo volume configurado pra essa
+    peça (ver pad_mixer.py) antes de repassar pro DrumGizmo. Só mexe na
+    cópia que vai pro áudio -- o valor ORIGINAL medido pelo ESP32 continua
+    sendo usado pro medidor/flash da tela e pra calibração (ver
+    midi_note_event), que devem mostrar a força real da pancada, não o
+    volume ajustado.
+
+    Efeito imediato, sem precisar recarregar o kit. Faixa 0.0 (mudo de
+    verdade -- 0 aqui faz o chamador NÃO mandar a nota nenhuma, ver os
+    dois call-sites) a 3.0 (300%, ver pad_mixer.py pra explicação de por
+    que a faixa foi ampliada além de 150%).
+    """
+    fator = pad_mixer.get_volume_factor(nota)
+    if fator == 1.0:
+        return velocity
+    if fator <= 0.0:
+        return 0  # mudo de verdade -- chamador não deve enviar a nota
+    v = int(round(velocity * fator))
+    return max(1, min(127, v))
 
 
 # ----------------------------------------------------------------
@@ -357,6 +414,12 @@ def handle_line(texto):
                     "filtro": int(partes[5]),
                     "invertido": int(partes[6]),
                 })
+                # campos novos (limiares da zona "meio-aberto" do hi-hat,
+                # nota 80) -- opcional, pra continuar aceitando um firmware
+                # mais antigo que só mande os 6 campos originais.
+                if len(partes) >= 9:
+                    hh_config["limiar_meio_aberto"] = int(partes[7])
+                    hh_config["limiar_fechado"] = int(partes[8])
             return
 
         if tipo == "HHSW" and len(partes) >= 4:
@@ -420,8 +483,11 @@ def handle_line(texto):
 
 def snapshot():
     with state_lock:
+        # traduz de volta pro id que o console web usa (ver PAD_ID_TO_FIRMWARE_IDX) --
+        # o console não sabe nada da ordem física do firmware, só da lista PADS do HTML.
+        pads_por_id_html = {FIRMWARE_IDX_TO_PAD_ID.get(idx, idx): p for idx, p in pads.items()}
         return {
-            "pads": dict(pads),
+            "pads": pads_por_id_html,
             "global": dict(global_config),
             "hh": dict(hh_config),
             "hhsw": dict(hhsw_config),
@@ -432,8 +498,80 @@ def midi_note_event(status, note, velocity):
     tipo = status & 0xF0
     if tipo == 0x90 and velocity > 0:
         broadcast({"type": "hit", "note": note, "velocity": velocity, "ts": time.time()})
+        with _learn_lock:
+            aprendendo = _learn_state["active"]
+            alvo = _learn_state["target_note"]
+        if aprendendo:
+            # IMPORTANTE: não pode chamar send_command_and_wait() direto
+            # daqui -- esta função roda dentro da MESMA thread que lê a
+            # serial (serial_reader_loop/processar_midi). send_command_and_wait
+            # bloqueia esperando a linha "OK,PAD" chegar, mas quem
+            # processaria essa linha e liberaria a espera é exatamente
+            # esta thread -- ou seja, chamar direto daria deadlock (trava
+            # até dar timeout, sempre). Por isso a reatribuição roda numa
+            # thread separada.
+            threading.Thread(target=_handle_learn_hit, args=(note, alvo), daemon=True).start()
     elif tipo == 0x80 or (tipo == 0x90 and velocity == 0):
         broadcast({"type": "note_off", "note": note, "ts": time.time()})
+
+
+# ----------------------------------------------------------------
+# DEFINIÇÃO MANUAL DE PAD ("MIDI learn"): configurando uma peça (nota
+# `target_note`, ex: 49 = Crash) na tela, o usuário pode em vez de vez
+# de mexer na imagem, clicar "definição manual" e bater na peça FÍSICA
+# que quer que passe a mandar aquele som -- a próxima pancada física
+# recebida tem seu pad de origem descoberto (por qual índice de PAD já
+# está configurado com a nota que realmente chegou) e reconfigurado no
+# ESP32 pra usar `target_note` dali em diante.
+# ----------------------------------------------------------------
+
+_learn_lock = threading.Lock()
+_learn_state = {"active": False, "target_note": None}
+_learn_generation = 0  # incrementado a cada start/cancel/conclusão, pra o timeout saber se já é "outra rodada"
+
+
+def _handle_learn_hit(note_fisica, target_note):
+    with _learn_lock:
+        if not _learn_state["active"] or _learn_state["target_note"] != target_note:
+            return  # outra rodada já cancelou/concluiu isso, ou não é a que esperávamos
+        _learn_state["active"] = False
+        _learn_state["target_note"] = None
+
+    with state_lock:
+        idx = next((i for i, p in pads.items() if p.get("nota") == note_fisica), None)
+        cached = dict(pads[idx]) if idx is not None else None
+
+    if idx is None or cached is None:
+        broadcast({
+            "type": "learn_result", "ok": False,
+            "error": f"a peça física que bateu manda a nota {note_fisica}, mas ela ainda não está "
+                     "sincronizada com o backend -- tente 'Sincronizar agora' na aba SISTEMA e bata de novo.",
+        })
+        return
+
+    if note_fisica == target_note:
+        broadcast({
+            "type": "learn_result", "ok": False,
+            "error": "essa peça física já manda exatamente essa nota -- nada pra mudar.",
+        })
+        return
+
+    cached["nota"] = target_note
+    cmd = f"PAD {idx} {cached['nota']} {cached['threshold']} {cached['velmax']} {cached['lockout']} {int(cached['ativo'])} {cached['curva']}"
+    result = send_command_and_wait(cmd, {"OK,PAD"})
+
+    if not result["ok"]:
+        broadcast({"type": "learn_result", "ok": False, "error": "o ESP32 não confirmou a mudança (timeout) -- tente de novo."})
+        return
+
+    with state_lock:
+        pads[idx] = cached
+    broadcast({"type": "state", **snapshot()})
+    broadcast({
+        "type": "learn_result", "ok": True,
+        "pad_idx": FIRMWARE_IDX_TO_PAD_ID.get(idx, idx),  # id do console web, não o índice físico
+        "old_note": note_fisica, "new_note": target_note,
+    })
 
 
 # ----------------------------------------------------------------
@@ -449,8 +587,12 @@ def processar_midi(status):
     if tipo in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
         dados = ser.read(2)
         if len(dados) == 2:
-            enviar_midi([status, dados[0], dados[1]])
-            midi_note_event(status, dados[0], dados[1])
+            nota, vel = dados[0], dados[1]
+            eh_note_on = (tipo == 0x90 and vel > 0)
+            vel_dg = _aplicar_volume_pad(nota, vel) if eh_note_on else vel
+            if not (eh_note_on and vel_dg == 0):  # volume 0% dessa peça -- não toca nada mesmo
+                enviar_midi([status, nota, vel_dg])
+            midi_note_event(status, nota, vel)  # broadcast usa a velocity REAL medida, não a ajustada
 
     elif tipo in (0xC0, 0xD0):
         dados = ser.read(1)
@@ -510,8 +652,12 @@ def serial_reader_loop():
                 if tipo in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
                     segundo = ser.read(1)
                     if segundo:
-                        enviar_midi([running_status, byte, segundo[0]])
-                        midi_note_event(running_status, byte, segundo[0])
+                        nota, vel = byte, segundo[0]
+                        eh_note_on = (tipo == 0x90 and vel > 0)
+                        vel_dg = _aplicar_volume_pad(nota, vel) if eh_note_on else vel
+                        if not (eh_note_on and vel_dg == 0):  # volume 0% dessa peça -- não toca nada mesmo
+                            enviar_midi([running_status, nota, vel_dg])
+                        midi_note_event(running_status, nota, vel)
                 elif tipo in (0xC0, 0xD0):
                     enviar_midi([running_status, byte])
 
@@ -559,15 +705,19 @@ def api_ping():
 
 @app.route("/api/pad/<int:idx>", methods=["POST"])
 def api_set_pad(idx):
+    # `idx` chega como o id do console web (lista PADS do HTML) -- traduz
+    # pro índice físico real do firmware antes de tocar em `pads` ou
+    # montar o comando (ver PAD_ID_TO_FIRMWARE_IDX pro porquê).
+    fw_idx = _fw_idx(idx)
     body = request.get_json(force=True, silent=True) or {}
 
     with state_lock:
-        cached = pads.get(idx)
+        cached = pads.get(fw_idx)
 
     if cached is None:
         refresh_from_esp32()
         with state_lock:
-            cached = pads.get(idx)
+            cached = pads.get(fw_idx)
 
     if cached is None:
         return jsonify({"ok": False, "error": "pad ainda não sincronizado -- tente /api/refresh"}), 409
@@ -577,12 +727,12 @@ def api_set_pad(idx):
         if campo in body:
             p[campo] = int(body[campo])
 
-    cmd = f"PAD {idx} {p['nota']} {p['threshold']} {p['velmax']} {p['lockout']} {int(p['ativo'])} {p['curva']}"
+    cmd = f"PAD {fw_idx} {p['nota']} {p['threshold']} {p['velmax']} {p['lockout']} {int(p['ativo'])} {p['curva']}"
     result = send_command_and_wait(cmd, {"OK,PAD"})
 
     if result["ok"]:
         with state_lock:
-            pads[idx] = p
+            pads[fw_idx] = p
         broadcast({"type": "state", **snapshot()})
         return jsonify({"ok": True, "pad": p})
 
@@ -633,9 +783,29 @@ def api_set_hihat():
     if not cached:
         return jsonify({"ok": False, "error": "HH ainda não sincronizado -- tente /api/refresh"}), 409
 
-    cached.update({k: int(v) for k, v in body.items() if k in ("ativo", "tipo", "aberto", "fechado", "filtro", "invertido")})
+    cached.update({
+        k: int(v) for k, v in body.items()
+        if k in ("ativo", "tipo", "aberto", "fechado", "filtro", "invertido", "limiar_meio_aberto", "limiar_fechado")
+    })
 
-    cmd = f"HH {cached['ativo']} {cached['tipo']} {cached['aberto']} {cached['fechado']} {cached['filtro']} {cached['invertido']}"
+    # Os limiares da zona "meio-aberto" (nota 80) podem nunca ter sido
+    # sincronizados ainda (firmware antigo, ou primeira sincronização
+    # depois de atualizar) -- usa os mesmos valores padrão de fábrica
+    # do firmware (config_bateria.h) como fallback, em vez de mandar
+    # um comando incompleto ou quebrar aqui.
+    lim_ma = cached.get("limiar_meio_aberto", 40)
+    lim_f = cached.get("limiar_fechado", 100)
+    if lim_ma >= lim_f:
+        lim_ma, lim_f = min(lim_ma, lim_f), max(lim_ma, lim_f)
+        if lim_ma == lim_f:
+            lim_f = min(127, lim_f + 1)
+    cached["limiar_meio_aberto"] = lim_ma
+    cached["limiar_fechado"] = lim_f
+
+    cmd = (
+        f"HH {cached['ativo']} {cached['tipo']} {cached['aberto']} {cached['fechado']} "
+        f"{cached['filtro']} {cached['invertido']} {cached['limiar_meio_aberto']} {cached['limiar_fechado']}"
+    )
     result = send_command_and_wait(cmd, {"OK,HH"})
 
     if result["ok"]:
@@ -709,6 +879,80 @@ def api_hhstatus():
     if result["ok"]:
         return jsonify({"ok": True, **hh_live})
     return jsonify(result), 504
+
+
+# ---- definição manual de pad ("MIDI learn") ----
+
+LEARN_TIMEOUT_S = 15.0
+
+
+@app.route("/api/learn/start", methods=["POST"])
+def api_learn_start():
+    global _learn_generation
+    body = request.get_json(force=True, silent=True) or {}
+    if "note" not in body:
+        return jsonify({"ok": False, "error": "faltou 'note' (a nota MIDI da peça sendo configurada agora)"}), 400
+    try:
+        target_note = int(body["note"])
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "'note' inválida"}), 400
+
+    with _learn_lock:
+        _learn_generation += 1
+        minha_geracao = _learn_generation
+        _learn_state["active"] = True
+        _learn_state["target_note"] = target_note
+
+    def _timeout_watchdog():
+        time.sleep(LEARN_TIMEOUT_S)
+        with _learn_lock:
+            if _learn_generation != minha_geracao or not _learn_state["active"]:
+                return  # já foi cancelado/concluído/substituído por outra rodada
+            _learn_state["active"] = False
+            _learn_state["target_note"] = None
+        broadcast({"type": "learn_result", "ok": False, "error": "tempo esgotado esperando uma pancada -- tente de novo."})
+
+    threading.Thread(target=_timeout_watchdog, daemon=True).start()
+    return jsonify({"ok": True, "listening_for_note": target_note, "timeout_s": LEARN_TIMEOUT_S})
+
+
+@app.route("/api/learn/cancel", methods=["POST"])
+def api_learn_cancel():
+    global _learn_generation
+    with _learn_lock:
+        _learn_generation += 1
+        _learn_state["active"] = False
+        _learn_state["target_note"] = None
+    return jsonify({"ok": True})
+
+
+# ---- mixer por pad (volume, guardado no Pi -- ver pad_mixer.py) ----
+
+@app.route("/api/mixer")
+def api_mixer_get():
+    return jsonify(pad_mixer.get_all())
+
+
+@app.route("/api/mixer/<int:note>", methods=["GET"])
+def api_mixer_get_one(note):
+    return jsonify(pad_mixer.get(note))
+
+
+@app.route("/api/mixer/<int:note>/volume", methods=["POST"])
+def api_mixer_set_volume(note):
+    body = request.get_json(force=True, silent=True) or {}
+    if "value" not in body:
+        return jsonify({"ok": False, "error": "faltou 'value' (0.0 a 3.0)"}), 400
+    try:
+        entry = pad_mixer.set_volume(note, body["value"])
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "'value' inválido"}), 400
+    # efeito imediato -- não precisa recarregar o kit nem avisar mais ninguém,
+    # a próxima pancada nessa nota já sai com o volume novo (0.0 = mudo de
+    # verdade, a nota nem é enviada pro DrumGizmo -- ver _aplicar_volume_pad).
+    return jsonify({"ok": True, "note": note, "mixer": entry})
+
+# (o balanço/pan por pad foi removido -- ver pad_mixer.py pra explicação)
 
 
 # ---- kits (DrumGizmo) ----
@@ -814,9 +1058,34 @@ if __name__ == "__main__":
     threading.Thread(target=serial_reader_loop, daemon=True).start()
 
     # sincroniza a config assim que sobe, pra já ter cache pronto
+    #
+    # IMPORTANTE (bug corrigido aqui): antes disso era só UMA tentativa,
+    # 0.3s depois de abrir a serial. A maioria das placas ESP32 REINICIA
+    # sozinha assim que a porta serial é aberta (efeito do DTR, igual ao
+    # Arduino) -- ou seja, bem na hora que esta thread tentava mandar o
+    # "GET", o ESP32 podia estar no meio do próprio boot e não responder
+    # nada. Sem uma segunda chance, pads/global/hi-hat ficavam vazios pro
+    # resto da execução (só uma troca de valor pelo HTML disparava um novo
+    # refresh, e mesmo assim só daquele campo específico) -- na prática
+    # era isso que fazia a aba GLOBAL aparecer com valores errados/vazios
+    # depois de religar o Raspberry ou o ESP32.
+    #
+    # Agora tenta várias vezes, com folga de sobra pro ESP32 terminar de
+    # reiniciar e responder, e para assim que a sincronização funcionar.
     def _initial_sync():
-        time.sleep(0.3)
-        refresh_from_esp32()
+        max_tentativas = 12
+        for tentativa in range(1, max_tentativas + 1):
+            time.sleep(0.3 if tentativa == 1 else 1.5)
+            result = refresh_from_esp32()
+            if result.get("ok"):
+                print(f"[backend] sincronização inicial com o ESP32 OK (tentativa {tentativa}/{max_tentativas})")
+                return
+        print(
+            f"[backend] aviso: não consegui sincronizar com o ESP32 na subida depois de "
+            f"{max_tentativas} tentativas -- confira a conexão serial. Os valores mostrados "
+            "no console podem ficar incompletos até uma sincronização manual (botão "
+            "'Sincronizar agora' na aba SISTEMA, ou /api/refresh)."
+        )
 
     threading.Thread(target=_initial_sync, daemon=True).start()
 
