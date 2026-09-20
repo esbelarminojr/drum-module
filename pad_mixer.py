@@ -6,27 +6,63 @@ Volume por pad (peça), guardado neste arquivo no Raspberry -- NÃO no
 ESP32. É um conceito diferente da sensibilidade do trigger (threshold/
 vel.máxima/curva/etc, já controlada pelo ESP32 -- ver PAD em
 drum_backend.py e o protocolo PAD do firmware): aqui é sobre como a
-nota que JÁ CHEGOU é tocada, não sobre como o piezo é lido. Fica só
-aqui no Pi de propósito, assim continua valendo não importa qual kit
-do DrumGizmo estiver ativo no momento, sobrevive a religar o
-Raspberry, e não precisa reflashar o firmware do ESP32 pra ajustar.
+nota que JÁ CHEGOU é tocada, não sobre como o piezo é lido.
 
-Chave: nota MIDI da peça (a mesma que o ESP32 já manda pra ela hoje,
-ou a nota resultante de uma "definição manual"/MIDI-learn).
+IMPORTANTE (2026-09-19): o volume agora é guardado POR KIT, não mais
+um valor único global pra cada nota. Motivo: cada kit tem seus
+próprios arquivos de áudio gravados com volumes relativos diferentes
+entre si -- o Crash de um kit pode já vir bem mais alto que o de
+outro -- então faz sentido poder deixar, por exemplo, a Crash a 140%
+só na Crocell e a 100% (original) em todos os outros kits, sem que um
+ajuste "vaze" pros demais. Estrutura do arquivo agora:
+
+    {
+      "<nome do kit>": {
+        "<nota MIDI>": {"volume": 1.4},
+        ...
+      },
+      ...
+    }
+
+Um kit que nunca teve nenhum ajuste feito simplesmente não aparece
+aqui -- toda peça dele vale 100% (original) até alguém mexer,
+kit por kit.
+
+Chave de nota: nota MIDI da peça (a mesma que o ESP32 já manda pra ela
+hoje, ou a nota resultante de uma "definição manual"/MIDI-learn).
 
   volume: 0.0 (mudo de verdade -- a nota nem chega a ser tocada, ver
           drum_backend.py) .. 1.0 (100%, padrão) .. 3.0 (300%, reforça
-          bastante uma peça fraca) -- aplicado numa escala da VELOCITY
-          do MIDI antes de mandar pro DrumGizmo (ver
-          _aplicar_volume_pad em drum_backend.py). Efeito instantâneo,
-          não precisa recarregar o kit.
+          bastante uma peça fraca).
 
-          Faixa ampliada de 0-150% pra 0-300% (2026-09-18) porque
-          150% ainda ficava fraco demais numa peça bem baixa -- como a
-          velocity final tem teto em 127, esse limite só ajuda
-          pancadas que chegam com velocity baixa (uma pancada que já
-          chega quase no talo continua sem espaço pra "aumentar mais",
-          isso é físico, não dá pra contornar só escalando).
+          IMPORTANTE (2026-09-18): valores diferentes de 0.0 NÃO são
+          aplicados escalando a velocity do MIDI na hora -- essa 1a
+          versão dava um efeito pequeno demais pra nivelar peças
+          gravadas com volumes bem diferentes entre si (ex: um Crash
+          bem mais alto que um Tom), porque o DrumGizmo não tem um
+          controle de ganho de verdade por instrumento (só "power" pra
+          escolher qual amostra tocar, não é volume). O valor aqui só
+          é o que fica GUARDADO; quem aplica de fato é
+          apply_pad_gain.py, reprocessando os .wav do instrumento com
+          um ganho real e recarregando o kit -- por isso, diferente de
+          um simples toggle, mudar o volume (exceto pra 0%/mudo)
+          demora alguns segundos e não é instantâneo (ver a rota
+          /api/mixer/<nota>/volume em drum_backend.py). Essa parte
+          continua guardando só o número escolhido, não o áudio
+          processado; o áudio processado fica nos próprios arquivos do
+          kit correspondente (ver apply_pad_gain.py sobre o backup
+          ".vol_original").
+
+          IMPORTANTE (2026-09-18, parte 2): kit_manager.py reaplica
+          automaticamente TODOS os volumes salvos aqui (só os DESSE
+          kit, ver get_all(kit_name)) nos arquivos dele toda vez que
+          esse kit é carregado -- no boot do Raspberry, ao trocar de
+          kit pela tela, e depois de reprocessar as amostras do zero
+          (setup_kits.py --force) -- ver
+          kit_manager._reapply_saved_volumes(). Por isso não precisa
+          repetir os ajustes de volume depois de nenhuma dessas coisas;
+          só este arquivo (o número escolhido) precisa continuar
+          salvo, o resto é automático.
 
 (O balanço/pan esquerda-direita por pad foi removido -- exigia
 reprocessar os .wav do instrumento a cada ajuste e, num dos kits reais
@@ -57,31 +93,37 @@ def _save(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def get_all():
-    """{nota(str): {volume}, ...} -- só o que já foi ajustado alguma vez
-    (peças nunca tocadas na aba de mixagem não aparecem aqui, mas vale
-    o padrão {volume:1.0} mesmo assim). Entradas antigas que ainda têm
-    uma chave "pan" (de antes do recurso ser removido) não atrapalham
-    nada -- só ficam ali sem uso, ignoradas por get()/get_volume_factor()."""
-    return _load()
+def get_all(kit_name):
+    """{nota(str): {volume}, ...} -- só as peças já ajustadas alguma vez
+    NESSE kit específico (peças nunca tocadas na aba de mixagem não
+    aparecem aqui, mas vale o padrão {volume:1.0} mesmo assim). Um kit
+    que nunca teve ajuste nenhum devolve {} (dict vazio), não erro."""
+    if not kit_name:
+        return {}
+    return _load().get(kit_name, {})
 
 
-def get(note):
+def get(note, kit_name):
+    if not kit_name:
+        return dict(_DEFAULT)
     data = _load()
-    entry = data.get(str(note), {})
+    entry = data.get(kit_name, {}).get(str(note), {})
     return {**_DEFAULT, **entry}
 
 
-def get_volume_factor(note):
-    return get(note)["volume"]
+def get_volume_factor(note, kit_name):
+    return get(note, kit_name)["volume"]
 
 
-def set_volume(note, value):
+def set_volume(note, value, kit_name):
+    if not kit_name:
+        raise ValueError("set_volume precisa saber de qual kit -- 'kit_name' não pode ser vazio")
     value = max(0.0, min(3.0, float(value)))
     data = _load()
+    kit_bucket = data.setdefault(kit_name, {})
     key = str(note)
-    entry = {**_DEFAULT, **data.get(key, {})}
+    entry = {**_DEFAULT, **kit_bucket.get(key, {})}
     entry["volume"] = value
-    data[key] = entry
+    kit_bucket[key] = entry
     _save(data)
     return entry

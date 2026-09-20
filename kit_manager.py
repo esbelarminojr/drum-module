@@ -564,6 +564,75 @@ def _spawn(name, cmd, cwd):
     return proc, offset
 
 
+def _reapply_saved_volumes(name, kit_cfg, cwd):
+    """Antes de QUALQUER kit começar a tocar, reaplica nos arquivos de
+    áudio dele os volumes por pad já salvos em pad_mixer.json (ver
+    pad_mixer.py e apply_pad_gain.py). Sem isso, o ganho só ficava
+    valendo enquanto os arquivos daquele kit continuassem exatamente
+    como apply_pad_gain.py os deixou -- bastava reiniciar o Raspberry
+    numa hora ruim, ou (principalmente) reprocessar as amostras do
+    zero (setup_kits.py --force, que sempre parte da fonte original)
+    pra "perder" o ajuste, mesmo com o número certo salvo o tempo
+    todo. Chamando isso aqui, toda vez que um kit é carregado -- no
+    boot, ao trocar de kit pela tela, ou depois de reprocessar as
+    amostras -- os volumes voltam sozinhos, sem precisar mexer nos
+    sliders de novo.
+
+    IMPORTANTE (2026-09-19): o volume agora é guardado POR KIT (ver
+    pad_mixer.py) -- por isso `name` (o nome do kit sendo carregado
+    agora, igual aparece em kits.json) é obrigatório aqui: só busca e
+    reaplica os ajustes feitos NESSE kit especificamente, nunca os de
+    outro. Cada kit tem seu próprio conjunto de instrumentos, então uma
+    nota que não existe no midimap desse kit em particular não é erro
+    -- só quer dizer que essa peça não está presente nele. Uma falha
+    num instrumento nunca deve impedir o kit de carregar; só avisa no
+    log e segue pros outros.
+    """
+    if "kit_xml" not in kit_cfg or not kit_cfg.get("midimap") or not cwd:
+        return  # kit configurado via launch_cmd na unha -- não dá pra reaplicar nada
+
+    try:
+        import pad_mixer
+        import apply_pad_gain as gain_mod
+    except Exception as e:
+        print("[kit_manager] aviso: não consegui importar pad_mixer/apply_pad_gain:", e)
+        return
+
+    entradas = pad_mixer.get_all(name)
+    if not entradas:
+        return
+
+    kit_xml_path = os.path.join(cwd, kit_cfg["kit_xml"])
+    midimap_path = os.path.join(cwd, kit_cfg["midimap"])
+    if not os.path.isfile(kit_xml_path) or not os.path.isfile(midimap_path):
+        return
+
+    aplicados = 0
+    for nota_s, entry in entradas.items():
+        volume = entry.get("volume", 1.0)
+        if volume <= 0.0:
+            continue  # mudo -- não mexe em arquivo nenhum (ver _aplicar_volume_pad)
+        try:
+            nota = int(nota_s)
+            instr_name = gain_mod.find_instrument_name(midimap_path, nota)
+            if not instr_name:
+                continue  # essa peça não existe nesse kit -- normal, não é erro
+            instr_file = gain_mod.find_instrument_file(kit_xml_path, instr_name)
+            if not instr_file:
+                continue
+            instr_xml_path = os.path.join(cwd, instr_file)
+            files = gain_mod.collect_all_files(instr_xml_path)
+            if not files:
+                continue
+            gain_mod.apply_gain_to_files(files, volume)
+            aplicados += 1
+        except Exception as e:
+            print(f"[kit_manager] aviso: falha ao reaplicar volume salvo da nota {nota_s}: {e}")
+
+    if aplicados:
+        print(f"[kit_manager] volume por pad reaplicado em {aplicados} instrumento(s) antes de carregar o kit {kit_cfg.get('kit_xml')!r}.")
+
+
 def start_kit(name, on_ready=None, on_progress=None):
     """
     Inicia o DrumGizmo com o kit `name` (deve existir em kits.json).
@@ -600,6 +669,13 @@ def start_kit(name, on_ready=None, on_progress=None):
     _set_usb_mixer_max()
     cmd = _build_cmd(kit_cfg, alsa_device=alsa_device)
     cwd = kit_cfg.get("cwd") or None
+
+    # garante que os volumes por pad já salvos estejam de fato nos
+    # arquivos de áudio ANTES do DrumGizmo os carregar (ver
+    # _reapply_saved_volumes) -- é o que faz o ajuste sobreviver a
+    # reboot, troca de kit e reprocessamento de amostras sem precisar
+    # repetir nada na tela.
+    _reapply_saved_volumes(name, kit_cfg, cwd)
 
     midi_port_name = data.get("midi_port_name", "ESP32 Drum")
 

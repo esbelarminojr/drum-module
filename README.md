@@ -27,6 +27,7 @@ drum-module-console.html          -- console web (servido pelo backend)
 install.sh                        -- instala o serviço systemd
 drum-backend.service.template     -- modelo do serviço (install.sh preenche)
 setup_rtpmidi.sh                  -- (opcional) expõe o MIDI pela rede pra gravar no PC -- ver "RTP-MIDI"
+midi_monitor.ps1                  -- (opcional, roda no Windows) monitor MIDI simples via PowerShell -- ver "RTP-MIDI"
 setup_shutdown_button.sh          -- (opcional) botão físico de liga/desliga seguro -- ver "Botão de liga/desliga"
 kits.json                         -- configuração dos kits (setup_kits.py atualiza sozinho)
 pad_mixer.json                    -- volume salvo por pad (criado sozinho no primeiro ajuste)
@@ -265,25 +266,43 @@ sudo ./setup_rtpmidi.sh
 
 Isso instala e configura o [rtpmidid](https://github.com/davidmoreno/rtpmidid)
 (RTP-MIDI/AppleMIDI pra Linux), expondo a porta MIDI virtual "ESP32
-Drum" pela rede. No Windows, instale o driver gratuito **rtpMIDI** (de
-Tobias Erichsen) -- este Raspberry deve aparecer sozinho na lista
-"Remote Sessions" (via Bonjour/mDNS); clique "Connect". Depois disso,
-qualquer DAW no Windows (Reaper, etc.) vai ver uma porta MIDI de
-entrada nova pra escolher na faixa do instrumento (EZdrummer/Addictive
-Drums).
+Drum" pela rede. **Testado de ponta a ponta** num Raspberry Pi 3B+ real
+(Debian 13 "trixie" arm64, rtpmidid 26.01) gravando num Windows via
+driver rtpMIDI -- latência local de ~5-6 ms.
+
+No Windows, instale o driver gratuito **rtpMIDI** (de Tobias Erichsen):
+https://www.tobias-erichsen.de/software/rtpmidi.html
+
+Esse driver depende do **Bonjour** (serviço de rede da Apple) pra
+descobrir o Raspberry sozinho na rede. Se o Windows não tiver o Bonjour
+instalado, ao tentar habilitar uma sessão no rtpMIDI aparece o erro
+"Bonjour-service-creation failed" -- nesse caso instale o **Bonjour
+Print Services for Windows** (gratuito):
+https://support.apple.com/en-us/106380 -- e reinicie o Windows depois.
+
+Com o Bonjour funcionando, o Raspberry deve aparecer sozinho na lista
+de sessões do rtpMIDI (na aba "Setup", lista "Directory"), com o nome
+do hostname do Raspberry (ex: "E-DRUM"). Selecione e clique
+"Connect". Se não aparecer sozinho depois de alguns segundos, adicione
+manualmente pelo botão "+" da lista "Directory", com o IP do Raspberry
+e porta 5004. **Antes de conectar em qualquer sessão, é preciso ter uma
+sessão própria habilitada** na lista "My Sessions" do rtpMIDI (marque o
+checkbox "Enabled") -- sem isso o botão "Connect" fica desabilitado.
+
+Depois de conectado, qualquer DAW no Windows (Reaper, etc.) vai ver uma
+porta MIDI de entrada nova pra escolher na faixa do instrumento
+(EZdrummer/Addictive Drums). Pra testar rápido sem precisar abrir um
+DAW, dá pra usar o `midi_monitor.ps1` (nesta mesma pasta) -- um script
+de PowerShell que mostra na tela cada nota MIDI recebida.
 
 Recomendado pra **gravar** (diferente do uso ao vivo, que é por Wi-Fi
 mesmo): ligar um cabo de rede direto entre o Raspberry e o PC, sem
 roteador no meio -- menos latência e bem mais estável que Wi-Fi.
 
-Aviso: este script ainda não foi validado contra hardware real em
-todas as versões do Raspberry Pi OS (foi escrito com base na
-documentação oficial do rtpmidid) -- por segurança, ele avisa e para
-(em vez de adivinhar) se algum passo não bater com o esperado (ex:
-pacote não disponível no `apt` desta versão do sistema -- nesse caso
-ele mesmo mostra como baixar o `.deb` direto do GitHub). Se algo
-falhar, o aviso impresso já indica o comando alternativo pra rodar;
-se mesmo assim não resolver, abra uma
+Se algo falhar rodando o `setup_rtpmidi.sh` (ex: pacote `rtpmidid` não
+disponível no `apt` desta versão do Raspberry Pi OS), o próprio script
+mostra como baixar o `.deb` certo direto do GitHub pra sua
+arquitetura/versão do Debian. Se mesmo assim não resolver, abra uma
 [issue](https://github.com/esbelarminojr/drum-module/issues) neste
 repositório descrevendo o que apareceu.
 

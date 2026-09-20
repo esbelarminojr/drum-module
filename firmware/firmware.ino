@@ -13,11 +13,18 @@
  * (F0 7D 'D' 'R' texto F7) para não se misturar com as notas MIDI
  * de verdade (que continuam sendo bytes 0x90/0x80 crus, como antes).
  *
- * Comandos aceitos agora (CAL/CALOFF -- streaming ao vivo do piezo
- * pra calibração -- ainda não implementado neste firmware):
+ * Comandos aceitos agora:
  *   PING                                        -> PONG
  *   GET                                         -> BEGINCONFIG, GLOBAL,..., HH,..., HHSW,...,
  *                                                   PAD,0,..  PAD,7,.. (um por pad), ENDCONFIG
+ *   CAL <idx 0-7>                                -> OK,CAL -- liga o streaming ao vivo do piezo
+ *                                                   desse pad (ver enviarStreamCalibracao()):
+ *                                                   manda periodicamente
+ *                                                   "CAL,<idx>,<atual>,<pico>,<threshold>,<velmax>,<lockout>"
+ *                                                   até chegar um CALOFF. Não interrompe a
+ *                                                   detecção normal de batida do pad -- ele
+ *                                                   continua tocando enquanto é calibrado.
+ *   CALOFF                                       -> OK,CALOFF -- desliga o streaming (qualquer pad)
  *   HH <ativo> <tipo> <aberto> <fechado> <filtro> <invertido> [<limiarMeioAberto> <limiarFechado>]
  *                                                -> os 2 últimos parâmetros são opcionais
  *                                                   (retrocompatível com consoles antigos de 6
@@ -66,6 +73,19 @@ bool detectandoBatida[NUM_PADS] = {false};
 unsigned long tempoInicioLeitura[NUM_PADS] = {0};
 unsigned long tempoUltimaBatida[NUM_PADS] = {0};
 int picoValor[NUM_PADS] = {0};
+
+// ================================================================
+// STREAMING AO VIVO PRA CALIBRAÇÃO (comandos CAL/CALOFF)
+// ================================================================
+//
+// calibrandoIdx: qual pad está sendo acompanhado ao vivo pela aba
+// CALIBRAÇÃO do console agora, ou -1 se nenhum (streaming desligado).
+// Só existe UM de cada vez (é o que o console pede -- CAL troca de
+// pad direto, sem precisar de CALOFF entre um e outro).
+//
+int calibrandoIdx = -1;
+unsigned long ultimoEnvioCal = 0;
+const unsigned long INTERVALO_ENVIO_CAL_MS = 60;  // ~16x/s -- fluido na tela sem inundar a serial/MIDI
 
 
 // ================================================================
@@ -651,6 +671,50 @@ void processarPads() {
 
 
 // ================================================================
+// STREAMING AO VIVO PRA CALIBRAÇÃO (CAL/CALOFF)
+// ================================================================
+//
+// Chamada a cada volta do loop() (igual processarPads()). Se
+// calibrandoIdx estiver ligado (>= 0), manda periodicamente uma
+// linha "CAL,<idx>,<atual>,<pico>,<threshold>,<velmax>,<lockout>"
+// -- o mesmo formato que drum_backend.py já esperava (ver o "tipo
+// == CAL" em process_line()) desde antes disso existir de verdade
+// aqui no firmware.
+//
+// "atual": leitura instantânea do piezo agora mesmo (analogRead puro,
+// sem detecção de batida nenhuma) -- serve pra ver o "chão" de ruído
+// do sensor em repouso.
+// "pico": enquanto uma pancada está sendo medida (mesma janela de
+// globalPeakTime usada pra disparar a nota de verdade, ver
+// processarPads()), mostra o pico crescendo em tempo real; fora de
+// uma pancada, cai pro valor atual -- assim dá pra ver tanto o ruído
+// de repouso quanto o pico de uma pancada de teste, sem interferir
+// em nada do disparo normal (esse pad continua tocando normalmente
+// enquanto está sendo calibrado).
+//
+void enviarStreamCalibracao() {
+  if (calibrandoIdx < 0) return;
+
+  unsigned long agora = millis();
+  if (agora - ultimoEnvioCal < INTERVALO_ENVIO_CAL_MS) return;
+  ultimoEnvioCal = agora;
+
+  int i = calibrandoIdx;
+  int atual = analogRead(GPIO_PADS[i]);
+  int pico = detectandoBatida[i] ? picoValor[i] : atual;
+
+  String s = "CAL,";
+  s += String(i); s += ",";
+  s += String(atual); s += ",";
+  s += String(pico); s += ",";
+  s += String(padThreshold[i]); s += ",";
+  s += String(padVelMax[i]); s += ",";
+  s += String(padLockout[i]);
+  enviarResposta(s);
+}
+
+
+// ================================================================
 // PROTOCOLO DE CONFIGURAÇÃO (SysEx) -- recebe comandos de texto do
 // Raspberry, responde encapsulado em SysEx pra não se misturar com
 // as notas MIDI reais.
@@ -901,11 +965,31 @@ void processarComando(String linha) {
     return;
   }
 
-  // CAL / CALOFF: ainda não implementados neste firmware (streaming
-  // ao vivo do valor bruto do piezo pra calibração -- diferente do
-  // PAD, que só grava/lê os parâmetros já definidos) -- responde um
-  // erro explícito em vez de ficar quieto, pra ficar claro no console
-  // que esse comando não teve efeito nenhum.
+  if (cmd == "CAL") {
+    // "CAL" + idx = 2 tokens.
+    if (contarTokens(linha) >= 2) {
+      int idx = tokenInt(linha, 1);
+      if (idx < 0 || idx >= NUM_PADS) {
+        enviarResposta("ERROR,CAL");
+        return;
+      }
+      calibrandoIdx = idx;
+      ultimoEnvioCal = 0;  // manda a primeira leitura já na próxima volta do loop, sem esperar o intervalo
+      enviarResposta("OK,CAL");
+    } else {
+      enviarResposta("ERROR,CAL");
+    }
+    return;
+  }
+
+  if (cmd == "CALOFF") {
+    calibrandoIdx = -1;
+    enviarResposta("OK,CALOFF");
+    return;
+  }
+
+  // comando desconhecido -- responde um erro explícito em vez de
+  // ficar quieto, pra ficar claro no console que não teve efeito.
   enviarResposta("ERROR,UNKNOWN");
 }
 
@@ -936,6 +1020,8 @@ void loop() {
   verificarPedalChick();
 
   processarPads();
+
+  enviarStreamCalibracao();
 
   delayMicroseconds(200);
 }

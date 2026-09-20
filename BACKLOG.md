@@ -192,7 +192,15 @@ a seção **"comandos PAD/GLOBAL no firmware"** no topo deste arquivo.
 Já implementado; precisa só reflashar o ESP32 com o `.ino` atualizado
 pra essa função passar a funcionar de verdade.
 
-## Feature: Raspberry criar sua própria rede Wi-Fi + redirecionar pro HTML sozinho
+## ❌ NÃO VAI FAZER (decidido em 2026-09-20) -- Feature: Raspberry criar sua própria rede Wi-Fi + redirecionar pro HTML sozinho
+
+**Decisão:** não precisa -- resolve simplesmente conectando o Raspberry
+no hotspot do celular de alguém (qualquer músico liga o compartilhamento
+de internet do próprio celular, o Pi conecta nele como cliente, do jeito
+que já funciona hoje). Não vale a complexidade extra de Access
+Point + portal cativo + Ethernet de apoio pra isso.
+
+Anotação original, mantida pra contexto (caso mude de ideia no futuro):
 
 Hoje o Raspberry só entra como CLIENTE na rede Wi-Fi de casa (é assim
 que ele aparece num IP tipo `192.168.24.7` -- não cria rede própria
@@ -285,7 +293,12 @@ config do chimbal):
   atualizado pra isso valer de verdade (a lógica em si não foi rodada
   no hardware físico).
 
-## Feature: usar como controlador MIDI USB pra um Windows (ou outro PC)
+## ✅ RESOLVIDO por outro caminho (2026-09-20) -- Feature: usar como controlador MIDI USB pra um Windows (ou outro PC)
+
+**Decisão:** resolvido pelo RTP-MIDI (ver seção acima) -- MIDI pela rede
+em vez de USB, sem precisar descobrir o modelo exato do ESP32 nem mexer
+no firmware. Anotação original mantida pra contexto (caso um dia
+realmente precise de USB/cabo em vez de rede):
 
 Ideia: conectar por USB e o módulo funcionar como um controlador MIDI
 de verdade pra um computador (Windows, por exemplo), já aplicando as
@@ -322,18 +335,44 @@ sub-caminhos possíveis, dependendo do chip exato usado:
 escrito na própria placa, ex: "ESP32-WROOM-32", "ESP32-S3", etc.) --
 isso decide qual dos dois caminhos seguir.
 
-## ✅ IMPLEMENTADO -- best-effort, não testado num Raspberry real (2026-09-18) -- Feature: gravar no PC (Reaper + EZdrummer/Addictive Drums) via MIDI de rede, sem mexer no hardware do módulo
+## ✅ IMPLEMENTADO e TESTADO num Raspberry real (2026-09-19/20) -- Feature: gravar no PC (Reaper + EZdrummer/Addictive Drums) via MIDI de rede, sem mexer no hardware do módulo
 
 **Como usar:** rodar `sudo ./setup_rtpmidi.sh` (opcional -- só quem for
 gravar precisa). Detalhes completos no README, seção "RTP-MIDI".
 
-**Aviso importante:** este script foi escrito com base na
-documentação oficial do rtpmidid (não deu pra testar contra um
-Raspberry real neste momento) -- ele avisa e para em vez de adivinhar
-se algo não bater (ex: pacote não disponível no apt desta versão do
-Raspberry Pi OS). Se algum passo falhar, roda o comando indicado na
-mensagem de erro -- se mesmo assim não resolver, abra uma issue no
-repositório descrevendo o que apareceu.
+**Testado ponta-a-ponta**: pad físico → ESP32 → Raspberry Pi 3B+ (Debian
+13 "trixie" arm64, rtpmidid 26.01) → rede local → Windows (driver rtpMIDI
+de Tobias Erichsen) → nota MIDI recebida (confirmado com um monitor MIDI
+simples, sem precisar de DAW). Latência local medida: ~5-6 ms.
+
+Dois bugs reais foram encontrados e corrigidos durante o teste:
+
+1. **`systemctl restart` chamado de dentro do script às vezes não
+   reiniciava de fato** o serviço (retornava sucesso mas o processo
+   continuava com o PID/timestamp antigos, então mudanças no `.ini` ou no
+   script de auto-conexão não pegavam até um restart manual). O script
+   agora confere se o `ActiveEnterTimestamp` realmente mudou depois do
+   `restart` e força um `stop`+`start` se não mudou (função
+   `restart_confirmando`).
+2. **O `rtpmidid` (nessa versão, 26.01) cria uma porta ALSA genérica
+   ("Network Export", ou o nome de `[alsa_announce]` quando aplicado) que
+   NÃO leva a nota até o peer conectado** -- a porta que realmente importa
+   é criada dinamicamente, uma por sessão remota conectada, nomeada com o
+   nome do computador remoto (ex: "DESKTOP-XYZ"). Só que ele cria DUAS
+   portas com esse mesmo nome por sessão -- conectar o "ESP32 Drum" nas
+   duas duplica cada nota do outro lado. O script de auto-conexão
+   (`rtpmidid-connect-loop.sh`, gerado pelo `setup_rtpmidi.sh`) agora
+   ignora a porta genérica e conecta só uma vez por nome de porta
+   encontrado, cobrindo também múltiplos peers conectados ao mesmo tempo.
+
+**No lado do Windows**, se aparecer o erro "Bonjour-service-creation
+failed" ao habilitar uma sessão no rtpMIDI, é sinal de que o **Bonjour
+Print Services** (serviço de rede da Apple, separado do driver rtpMIDI)
+não está instalado -- baixar em
+https://support.apple.com/en-us/106380, instalar, reiniciar o Windows e
+tentar de novo. Depois disso o rtpMIDI passa a descobrir a sessão do
+Raspberry sozinho via mDNS (aparece como o hostname do Raspberry, ex:
+"E-DRUM", na lista de sessões/Directory).
 
 Pedido original, mantido pra contexto:
 

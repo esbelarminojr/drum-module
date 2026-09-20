@@ -56,8 +56,11 @@ Comandos que este processo manda pro ESP32 (texto, uma linha):
     GLOBAL <peak> <minvel> <duration> <canal>
     HH <ativo> <tipo> <aberto> <fechado> <filtro> <invertido> [<limiarMeioAberto> <limiarFechado>]
     HHSW <ativo> <invertido> <forcar_fechado>
-    CAL <idx>              -- ainda não implementado no firmware (streaming ao vivo)
-    CALOFF                 -- idem
+    CAL <idx>              -- <idx> aqui também é o índice FÍSICO do firmware,
+                              já traduzido (ver /api/cal/<idx>/start) -- liga o
+                              streaming ao vivo do piezo desse pad (telemetria
+                              "CAL,..." abaixo, contínua até um CALOFF)
+    CALOFF                 -- desliga o streaming (de qualquer pad)
     HHSTATUS
 
 Respostas do ESP32 (sempre chegam encapsuladas em SysEx):
@@ -92,6 +95,8 @@ tem 8 pads) e continuam sem tradução -- ficam permanentemente como
 import glob
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -215,25 +220,37 @@ def enviar_midi(msg):
 
 
 def _aplicar_volume_pad(nota, velocity):
-    """Escala a velocity de um note-on pelo volume configurado pra essa
-    peça (ver pad_mixer.py) antes de repassar pro DrumGizmo. Só mexe na
-    cópia que vai pro áudio -- o valor ORIGINAL medido pelo ESP32 continua
-    sendo usado pro medidor/flash da tela e pra calibração (ver
-    midi_note_event), que devem mostrar a força real da pancada, não o
-    volume ajustado.
+    """Só decide se a nota deve ser MUDADA (volume=0%) antes de repassar
+    pro DrumGizmo -- o ajuste de volume em si (0% a 300%) agora é feito
+    de verdade no próprio arquivo de áudio do instrumento (ver
+    apply_pad_gain.py e a rota /api/mixer/<nota>/volume), não mais
+    escalando a velocity aqui como antes. Motivo da mudança: o
+    DrumGizmo não tem controle de ganho por instrumento (só "power" pra
+    escolher qual amostra tocar), e escalar só a velocity dava uma
+    diferença pequena demais pra nivelar peças gravadas com volumes bem
+    diferentes entre si (ex: um Crash bem mais alto que um Tom).
 
-    Efeito imediato, sem precisar recarregar o kit. Faixa 0.0 (mudo de
-    verdade -- 0 aqui faz o chamador NÃO mandar a nota nenhuma, ver os
-    dois call-sites) a 3.0 (300%, ver pad_mixer.py pra explicação de por
-    que a faixa foi ampliada além de 150%).
+    O valor ORIGINAL medido pelo ESP32 continua sendo usado pro
+    medidor/flash da tela e pra calibração (ver midi_note_event), que
+    devem mostrar a força real da pancada, não o volume ajustado.
+
+    IMPORTANTE (2026-09-19): o volume é por KIT agora (ver pad_mixer.py)
+    -- por isso olha qual kit está ativo AGORA pra saber qual "mudo"
+    vale. Sem nenhum kit ativo (não deveria acontecer em uso normal),
+    não muta nada -- deixa a nota passar normal.
+
+    Devolve a velocity sem alteração quando o pad não estiver mudo, ou
+    0 quando estiver (0 = "não manda a nota nenhuma", ver os dois
+    call-sites) -- essa parte continua instantânea, sem precisar
+    recarregar o kit.
     """
-    fator = pad_mixer.get_volume_factor(nota)
-    if fator == 1.0:
+    kit_name = kit_manager.get_active_kit()
+    if not kit_name:
         return velocity
+    fator = pad_mixer.get_volume_factor(nota, kit_name)
     if fator <= 0.0:
         return 0  # mudo de verdade -- chamador não deve enviar a nota
-    v = int(round(velocity * fator))
-    return max(1, min(127, v))
+    return velocity
 
 
 # ----------------------------------------------------------------
@@ -444,9 +461,16 @@ def handle_line(texto):
             return
 
         if tipo == "CAL" and len(partes) >= 7:
+            # o firmware manda seu próprio índice físico (0-7) -- traduz de
+            # volta pro id que o console web usa (PADS do HTML) antes de
+            # repassar, senão o "cal" chega marcado pro pad errado do lado
+            # do navegador (mesmo problema que PAD_ID_TO_FIRMWARE_IDX já
+            # resolve pras outras rotas).
+            fw_idx = int(partes[1])
+            pad_id = FIRMWARE_IDX_TO_PAD_ID.get(fw_idx, fw_idx)
             msg = {
                 "type": "cal",
-                "pad": int(partes[1]),
+                "pad": pad_id,
                 "atual": int(partes[2]),
                 "pico": int(partes[3]),
                 "threshold": int(partes[4]),
@@ -863,7 +887,15 @@ def api_reset():
 
 @app.route("/api/cal/<int:idx>/start", methods=["POST"])
 def api_cal_start(idx):
-    result = send_command_and_wait(f"CAL {idx}", {"OK,CAL"})
+    # `idx` chega como o id do console web (lista PADS do HTML) -- IGUAL
+    # à rota /api/pad/<idx>, precisa traduzir pro índice físico real do
+    # firmware antes de mandar o comando (ver PAD_ID_TO_FIRMWARE_IDX).
+    # Sem isso, calibrar "Hi-Hat" pela tela transmitia o sinal ao vivo do
+    # "Crash" no firmware, sem erro nenhum pra avisar.
+    if idx not in PAD_ID_TO_FIRMWARE_IDX:
+        return jsonify({"ok": False, "error": f"pad {idx!r} não tem entrada física no firmware (Splash/China/Tom4 não têm ADC)"}), 400
+    fw_idx = _fw_idx(idx)
+    result = send_command_and_wait(f"CAL {fw_idx}", {"OK,CAL"})
     return jsonify(result), (200 if result["ok"] else 504)
 
 
@@ -930,29 +962,103 @@ def api_learn_cancel():
 
 @app.route("/api/mixer")
 def api_mixer_get():
-    return jsonify(pad_mixer.get_all())
+    # volume agora é por kit (ver pad_mixer.py) -- sem kit ativo (não
+    # deveria acontecer em uso normal) devolve vazio, não erro.
+    return jsonify(pad_mixer.get_all(kit_manager.get_active_kit()))
 
 
 @app.route("/api/mixer/<int:note>", methods=["GET"])
 def api_mixer_get_one(note):
-    return jsonify(pad_mixer.get(note))
+    return jsonify(pad_mixer.get(note, kit_manager.get_active_kit()))
 
 
 @app.route("/api/mixer/<int:note>/volume", methods=["POST"])
 def api_mixer_set_volume(note):
+    """
+    Volume por pad reprocessa de verdade os arquivos de áudio do
+    instrumento correspondente a essa nota NO KIT ATIVO AGORA (ver
+    apply_pad_gain.py) e recarrega o DrumGizmo -- por isso demora
+    alguns segundos e avisa o resultado via WebSocket
+    ({"type": "kit_status"}) em vez de deixar a requisição HTTP
+    pendurada esperando.
+
+    (Antes disso era feito escalando a velocity do MIDI na hora, sem
+    reprocessar nada -- mas na prática só dava uma diferença pequena,
+    insuficiente pra nivelar peças gravadas com volumes bem diferentes
+    entre si (ex: Crash bem mais alto que Tom), já que o DrumGizmo não
+    tem um controle de ganho de verdade por instrumento, só "power"
+    pra escolher qual amostra tocar. Só reprocessar o áudio resolve
+    isso de vez.)
+
+    Exceção: volume=0.0 (mudo) continua instantâneo e não mexe em
+    nenhum arquivo -- a nota simplesmente deixa de ser mandada pro
+    DrumGizmo (ver _aplicar_volume_pad), então não precisa recarregar
+    nada pra mutar/desmutar.
+
+    IMPORTANTE (2026-09-19): o volume é salvo POR KIT (ver
+    pad_mixer.py) -- essa nota pode ter um volume diferente em cada
+    kit, de propósito (cada kit grava as peças com volumes relativos
+    diferentes entre si). Trocar de kit não reseta nada: cada kit
+    lembra o SEU próprio ajuste, reaplicado sozinho toda vez que ele
+    carrega (ver kit_manager._reapply_saved_volumes). Regerar as
+    amostras do zero (setup_kits.py --force) também reaplica sozinho.
+    """
     body = request.get_json(force=True, silent=True) or {}
     if "value" not in body:
         return jsonify({"ok": False, "error": "faltou 'value' (0.0 a 3.0)"}), 400
     try:
-        entry = pad_mixer.set_volume(note, body["value"])
+        volume_value = max(0.0, min(3.0, float(body["value"])))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "'value' inválido"}), 400
-    # efeito imediato -- não precisa recarregar o kit nem avisar mais ninguém,
-    # a próxima pancada nessa nota já sai com o volume novo (0.0 = mudo de
-    # verdade, a nota nem é enviada pro DrumGizmo -- ver _aplicar_volume_pad).
-    return jsonify({"ok": True, "note": note, "mixer": entry})
 
-# (o balanço/pan por pad foi removido -- ver pad_mixer.py pra explicação)
+    active_kit_name = kit_manager.get_active_kit()
+    if not active_kit_name:
+        return jsonify({"ok": False, "error": "nenhum kit ativo agora -- não dá pra saber em qual kit salvar esse volume"}), 409
+
+    if volume_value <= 0.0:
+        # mudo de verdade -- instantâneo, não mexe em arquivo nenhum
+        # nem recarrega o kit (ver _aplicar_volume_pad).
+        entry = pad_mixer.set_volume(note, 0.0, active_kit_name)
+        return jsonify({"ok": True, "note": note, "kit": active_kit_name, "mixer": entry})
+
+    paths = kit_manager.get_active_kit_paths()
+    if not paths:
+        return jsonify({"ok": False, "error": "kit ativo não usa o formato cwd/kit_xml/midimap -- não dá pra ajustar volume nele"}), 409
+
+    script = os.path.join(BASE_DIR, "apply_pad_gain.py")
+    proc = subprocess.run(
+        [sys.executable, script, paths["cwd"], paths["kit_xml"], paths["midimap"], str(note), str(volume_value)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        print("[backend] apply_pad_gain.py falhou:", proc.stdout, proc.stderr)
+        return jsonify({
+            "ok": False,
+            "error": "não consegui ajustar o volume nesse instrumento -- veja o motivo",
+            "detail": (proc.stdout + "\n" + proc.stderr).strip()[-2000:],
+        }), 400
+
+    entry = pad_mixer.set_volume(note, volume_value, active_kit_name)
+    kit_name = paths["name"]
+
+    def _on_ready(ok, message):
+        broadcast({"type": "kit_status", "kit": kit_name, "ok": ok, "message": message})
+
+    def _on_progress(atual, total):
+        broadcast({"type": "kit_progress", "kit": kit_name, "current": atual, "total": total})
+
+    try:
+        kit_manager.switch_kit(kit_name, on_ready=_on_ready, on_progress=_on_progress)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"volume ajustado, mas falhou ao recarregar o kit: {e}"}), 500
+
+    broadcast({"type": "kit", "kit": kit_name})
+    return jsonify({"ok": True, "note": note, "mixer": entry, "loading": True, "detail": proc.stdout.strip()})
+
+# (o balanço/pan por pad foi removido -- ver pad_mixer.py pra explicação;
+# o volume, ao contrário do pan, funciona pra qualquer instrumento porque
+# o ganho é aplicado igual nos dois canais -- não depende de Out1/Out2
+# serem arquivos diferentes.)
 
 
 # ---- kits (DrumGizmo) ----
