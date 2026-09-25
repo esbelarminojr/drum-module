@@ -1,0 +1,33 @@
+[Unit]
+# Painel físico do módulo de bateria (display LCD 16x2 + 3 botões) --
+# navega e carrega kits sem precisar abrir o console web. Sobe depois
+# do backend porque depende dele (fala com a API HTTP + WebSocket dele
+# em 127.0.0.1) -- mas se o backend ainda não estiver pronto, este
+# serviço não trava: fica mostrando "Conectando..." e tentando de novo
+# sozinho até conseguir.
+Description=Painel físico do módulo de bateria (LCD + botões)
+After=drum-backend.service
+Wants=drum-backend.service
+
+[Service]
+Type=simple
+User=__DRUM_USER__
+Group=__DRUM_GROUP__
+
+WorkingDirectory=__DRUM_DIR__
+ExecStart=/usr/bin/python3 __DRUM_DIR__/lcd_panel.py
+
+# folga pra dar tempo do backend começar a subir antes da primeira
+# tentativa de conexão (o próprio script já tenta de novo sozinho por
+# dentro, isso aqui só evita um monte de tentativas falhas logo de cara)
+ExecStartPre=/bin/sleep 3
+
+# se cair por qualquer motivo, tenta subir de novo sozinho
+Restart=on-failure
+RestartSec=5
+
+# aparece no `journalctl -u lcd-panel`
+SyslogIdentifier=lcd-panel
+
+[Install]
+WantedBy=multi-user.target

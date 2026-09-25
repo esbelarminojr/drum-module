@@ -7,17 +7,24 @@
 # extra rodando).
 #
 # Fiação (fazer isso na hora de montar a caixa física do módulo):
-#   - um botão simples (2 fios) entre o pino GPIO3 (pino físico 5 na
-#     régua de 40 pinos) e um pino de GND vizinho (ex: pino físico 6,
-#     bem ao lado).
+#   - um botão simples (2 fios) entre o pino GPIO24 (pino físico 18 na
+#     régua de 40 pinos) e um pino de GND vizinho (ex: pino físico 20,
+#     bem ao lado -- ou o mesmo GND compartilhado com os outros botões
+#     do painel LCD, ver README.md).
+#
+# IMPORTANTE: este projeto usa GPIO24 em vez do GPIO3 padrão da
+# documentação oficial -- decisão tomada pra deixar o GPIO3 livre
+# (junto com o GPIO2/I2C) e agrupar os 4 botões físicos (3 de
+# navegação do painel LCD + este de desligar) numa faixa contígua e
+# sem função especial do header (pinos físicos 11/13/16/18).
 #
 # Depois de rodar este script + religar uma vez: apertar o botão
 # desliga o sistema com segurança (equivalente a 'sudo shutdown -h
 # now') -- e, como é a versão Lite (sem ambiente gráfico), desliga
 # direto, sem tela de confirmação. O mesmo botão também LIGA o
 # Raspberry de volta se apertado enquanto ele estiver desligado
-# (propriedade do próprio pino GPIO3) -- na prática vira um botão
-# único de liga/desliga do módulo.
+# (propriedade do próprio pino GPIO, independente de qual for) -- na
+# prática vira um botão único de liga/desliga do módulo.
 #
 # IMPORTANTE: isso desliga o SISTEMA OPERACIONAL com segurança, mas
 # não corta a energia física -- ainda precisa tirar da tomada (ou usar
@@ -25,7 +32,7 @@
 # nada (esperar o LED verde parar de piscar antes).
 #
 # Seguro rodar mesmo antes de ligar o botão de verdade -- sem nada
-# ligado ao GPIO3, o pino fica só "flutuando puxado pra cima" e nunca
+# ligado ao GPIO24, o pino fica só "flutuando puxado pra cima" e nunca
 # aciona sozinho.
 #
 # Uso:
@@ -54,10 +61,16 @@ fi
 
 echo "Usando: $CONFIG_TXT"
 
-LINE="dtoverlay=gpio-shutdown"
+LINE="dtoverlay=gpio-shutdown,gpio_pin=24"
 
 if grep -q "^${LINE}$" "$CONFIG_TXT"; then
   echo "Já está configurado (linha '${LINE}' já existe em $CONFIG_TXT) -- nada a fazer."
+elif grep -q "^dtoverlay=gpio-shutdown\b" "$CONFIG_TXT"; then
+  # já existe uma linha gpio-shutdown antiga (ex: sem gpio_pin, apontando
+  # pro GPIO3 padrão) -- substitui em vez de duplicar
+  cp "$CONFIG_TXT" "$CONFIG_TXT.bak.$(date +%s)"
+  sed -i "s#^dtoverlay=gpio-shutdown\b.*#${LINE}#" "$CONFIG_TXT"
+  echo "Linha antiga de gpio-shutdown substituída por '$LINE' em $CONFIG_TXT (backup salvo como $CONFIG_TXT.bak.*)"
 else
   cp "$CONFIG_TXT" "$CONFIG_TXT.bak.$(date +%s)"
   echo "" >> "$CONFIG_TXT"
@@ -71,8 +84,8 @@ echo "================================================================"
 echo "Pronto. PRECISA REINICIAR pra valer:"
 echo "    sudo reboot"
 echo
-echo "Fiação: um botão simples entre o pino físico 5 (GPIO3) e o pino"
-echo "físico 6 (GND, bem ao lado dele) na régua de 40 pinos."
+echo "Fiação: um botão simples entre o pino físico 18 (GPIO24) e um pino"
+echo "de GND (ex: físico 20, bem ao lado) na régua de 40 pinos."
 echo
 echo "Depois de reiniciar com o botão ligado: apertar desliga com"
 echo "segurança; apertar de novo com o Raspberry desligado, liga."

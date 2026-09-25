@@ -318,13 +318,87 @@ sudo reboot
 ```
 
 Fiação (na hora de montar a caixa física): um botão simples entre o
-pino físico 5 (GPIO3) e o pino físico 6 (GND, bem ao lado) na régua de
-40 pinos. Depois de reiniciar: apertar desliga com segurança (igual
-`sudo shutdown -h now`); apertar de novo com o Raspberry desligado,
-liga -- na prática um botão único de liga/desliga. Isso desliga o
-sistema operacional com segurança, mas não corta a energia física --
-ainda precisa tirar da tomada depois (só que aí sem risco, esperando o
-LED verde parar de piscar antes).
+pino físico 18 (GPIO24) e um pino de GND (ex: físico 20, bem ao lado)
+na régua de 40 pinos -- esse botão pode compartilhar o mesmo fio de
+GND dos 3 botões do painel LCD (ver seção seguinte), já que GND é o
+mesmo nó elétrico em qualquer pino de terra do header. Depois de
+reiniciar: apertar desliga com segurança (igual `sudo shutdown -h
+now`); apertar de novo com o Raspberry desligado, liga -- na prática
+um botão único de liga/desliga. Isso desliga o sistema operacional com
+segurança, mas não corta a energia física -- ainda precisa tirar da
+tomada depois (só que aí sem risco, esperando o LED verde parar de
+piscar antes).
+
+(Usamos GPIO24 em vez do GPIO3 padrão da documentação oficial de
+propósito -- decisão tomada junto com o painel LCD abaixo, pra deixar
+o GPIO3/GPIO2 (I2C) livres e agrupar os 4 botões físicos do módulo
+numa faixa contígua do header sem função especial.)
+
+## Painel físico (display LCD 16x2 + 3 botões)
+
+Alternativa ao console web pra trocar de kit direto no módulo, sem
+precisar de celular: um display de texto 16x2 (HD44780, modo paralelo
+4 bits) mostra o kit sendo navegado, e 3 botões (Anterior/OK/Próximo)
+passeiam pela lista e confirmam o carregamento -- exatamente como os
+botões "Anterior"/"Próximo"/"Carregar kit" do console web, e mostrando
+o mesmo progresso de carregamento (%) em tempo real. Fora do modo de
+navegação (ex: ajustar calibração, aparência, importar músicas), o
+console web continua sendo a única forma de configurar o sistema --
+o painel LCD é só pra trocar de kit rapidamente.
+
+Instalação:
+
+```
+sudo ./setup_lcd_panel.sh
+sudo reboot
+```
+
+Isso instala o `python3-rpi.gpio` (via apt), as bibliotecas `RPLCD` e
+`websocket-client` (via pip), coloca o usuário no grupo `gpio` (se
+ainda não estiver) e registra o serviço `lcd-panel` (sobe sozinho
+depois do `drum-backend`, e se reconecta sozinho se o backend cair/
+demorar a subir).
+
+Fiação -- pinos em numeração BCM, com o pino físico correspondente do
+header de 40 vias entre parênteses:
+
+| Display (pino) | Função | Raspberry Pi |
+|---|---|---|
+| 1 (VSS) | Terra | GND |
+| 2 (VDD) | +5V | 5V |
+| 3 (V0) | Contraste | cursor de um trimpot 10kΩ (pontas em 5V e GND) |
+| 4 (RS) | Seleção de registro | GPIO5 (físico 29) |
+| 5 (RW) | Leitura/escrita | GND direto (fixo -- só escrevemos) |
+| 6 (E) | Enable | GPIO6 (físico 31) |
+| 7-10 (D0-D3) | Dados (modo 4 bits) | sem ligação |
+| 11 (D4) | Dados | GPIO13 (físico 33) |
+| 12 (D5) | Dados | GPIO19 (físico 35) |
+| 13 (D6) | Dados | GPIO26 (físico 37) |
+| 14 (D7) | Dados | GPIO18 (físico 12) |
+| 15 (A) | Luz de fundo (+) | 5V (com resistor em série se o módulo não tiver um embutido) |
+| 16 (K) | Luz de fundo (-) | GND |
+
+(Se algum dia este texto e o código divergirem, o `lcd_panel.py`
+manda -- as constantes `PIN_*` no topo do arquivo são a fonte de
+verdade, porque são o que a Raspberry realmente executa.)
+
+Botões (a outra perna de cada um no GND -- pull-up interno, sem
+precisar de resistor externo; pode compartilhar o mesmo GND entre os
+três e com o botão de desligar):
+
+| Botão | GPIO (BCM) | Pino físico |
+|---|---|---|
+| Anterior (◄) | GPIO17 | 11 |
+| OK / Confirmar | GPIO27 | 13 |
+| Próximo (►) | GPIO23 | 16 |
+| Desligar (existente) | GPIO24 | 18 |
+
+Confira o serviço:
+
+```
+systemctl status lcd-panel --no-pager
+journalctl -u lcd-panel -f
+```
 
 ## Solução de problemas rápida
 

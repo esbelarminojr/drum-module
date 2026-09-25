@@ -409,12 +409,20 @@ módulo já tem -- nenhuma mudança de hardware ou firmware:
    `192.168.10.2`) pra não depender da auto-negociação de rede, que
    pode demorar uns segundos toda vez que conectar o cabo.
 
-## ✅ IMPLEMENTADO (2026-09-18) -- Feature: botão físico de liga/desliga seguro (sem precisar de tela/teclado)
+## ✅ IMPLEMENTADO (2026-09-18, pino mudado em 2026-09-24) -- Feature: botão físico de liga/desliga seguro (sem precisar de tela/teclado)
 
 **Como usar:** rodar `sudo ./setup_shutdown_button.sh` (idempotente,
 seguro rodar mesmo antes do botão físico estar ligado) + `sudo reboot`
-uma vez. Ligar o botão entre o pino físico 5 (GPIO3) e o pino físico 6
-(GND) só na hora de montar a caixa. Detalhes no README.
+uma vez. Ligar o botão entre o pino físico 18 (GPIO24) e um pino de
+GND (ex: físico 20) só na hora de montar a caixa. Detalhes no README.
+
+**Mudança de pino (2026-09-24):** passou de GPIO3 (pino físico 5,
+padrão da documentação oficial) pra GPIO24 (pino físico 18) -- decidido
+junto com o painel LCD (ver item abaixo), pra deixar o GPIO3/GPIO2
+(I2C) livres e agrupar os 4 botões físicos do módulo (3 de navegação +
+este) numa faixa contígua do header sem função especial (pinos físicos
+11/13/16/18). O script já cuida de substituir uma linha antiga
+`dtoverlay=gpio-shutdown` (sem `gpio_pin`) por essa nova, sem duplicar.
 
 Pedido original, mantido pra contexto:
 
@@ -427,11 +435,12 @@ vez.
 **Solução: usar o recurso `gpio-shutdown` já embutido no Raspberry Pi
 OS** -- não precisa de nenhum programa/serviço extra:
 
-1. Ligar um botão simples (2 fios) entre o pino **GPIO3** e um pino de
-   **GND** vizinho na régua de pinos do Raspberry.
+1. Ligar um botão simples (2 fios) entre o pino **GPIO24** (pino
+   físico 18) e um pino de **GND** vizinho na régua de pinos do
+   Raspberry.
 2. Adicionar uma linha no arquivo `/boot/firmware/config.txt`:
    ```
-   dtoverlay=gpio-shutdown
+   dtoverlay=gpio-shutdown,gpio_pin=24
    ```
 3. Reiniciar uma vez pra aplicar.
 
@@ -439,8 +448,8 @@ A partir daí: apertou o botão, o sistema desliga sozinho com segurança
 (equivalente a `sudo shutdown -h now`) -- como é a versão "Lite" (sem
 ambiente gráfico), desliga direto, sem tela de confirmação nenhuma.
 Bônus: esse mesmo botão também LIGA o Raspberry de volta se apertado
-enquanto ele estiver desligado (propriedade do próprio pino GPIO3) --
-na prática vira um botão único de liga/desliga do módulo.
+enquanto ele estiver desligado (propriedade do próprio pino, qualquer
+que seja) -- na prática vira um botão único de liga/desliga do módulo.
 
 **Detalhe importante:** isso desliga o sistema operacional com
 segurança, mas não cort a energia física -- ainda precisa tirar da
@@ -455,6 +464,54 @@ ajuste (alguns relatos de usuários do Bookworm mencionam precisar
 habilitar "Remote GPIO" nas configurações -- não confirmado se isso se
 aplica à versão Lite usada aqui).
 
+## ✅ IMPLEMENTADO (2026-09-24) -- Feature: painel físico (display LCD 16x2 + 3 botões) pra navegar/carregar kits sem o console web
+
+**Como usar:** rodar `sudo ./setup_lcd_panel.sh` + `sudo reboot` uma
+vez. Detalhes de fiação e pinagem completa no README.md (seção "Painel
+físico").
+
+**Pedido original:** tela de 2 linhas + 3 push buttons (avançar/voltar/
+OK) ligados direto no Raspberry, servindo como alternativa ao console
+web só pra trocar de kit -- sem precisar abrir o HTML no celular.
+Console web continua sendo a única forma de mexer em configuração/
+calibração/aparência/importação; o painel é só navegação rápida de
+kit.
+
+**Comportamento decidido:** os botões Anterior/Próximo só passeiam
+pela lista de kits (igual os botões #kit-prev/#kit-next do HTML --
+não carregam nada sozinhos), e o botão OK é quem manda carregar de
+fato (equivalente ao botão "Carregar kit" do HTML). Se o kit navegado
+já é o ativo, OK não faz nada (mesmo comportamento de esconder o botão
+"Carregar kit" no HTML nesse caso). O progresso de carregamento (%)
+aparece na segunda linha do display, alimentado pelo mesmo WebSocket
+(`/ws`, mensagens `kit`/`kit_progress`/`kit_status`) que já alimenta a
+barra de progresso do console web -- então se alguém trocar de kit
+pelo celular enquanto o painel está ligado, o painel acompanha sozinho
+sem precisar reiniciar nada.
+
+**Implementação:** `lcd_panel.py` (novo) roda como serviço systemd
+separado (`lcd-panel`, via `lcd-panel.service.template` +
+`setup_lcd_panel.sh`), depois do `drum-backend` -- fala com ele só por
+HTTP local (`GET /api/kits`, `POST /api/kits/<nome>/load`) e WebSocket
+(`ws://127.0.0.1:8000/ws`), sem tocar em nenhum código do backend nem
+do firmware do ESP32. Usa `RPLCD` (driver HD44780 em modo 4 bits) +
+`RPi.GPIO` pro display e os botões, e `websocket-client` pra escutar o
+progresso em tempo real.
+
+**Pinagem decidida (BCM):** display RS=GPIO5, E=GPIO6, D4=GPIO13,
+D5=GPIO19, D6=GPIO26, D7=GPIO18 (RW fixo no GND); botões
+Anterior=GPIO17, OK=GPIO27, Próximo=GPIO23. O botão de desligar
+existente foi remapeado de GPIO3 pra GPIO24 (ver item acima) pra ficar
+nessa mesma faixa contígua de pinos sem função especial (físicos
+11/13/16/18).
+
+**Ainda não testado em hardware real** (só revisado/verificado por
+leitura de código nesta sessão) -- falta validar na prática: timing
+do display (o `RPLCD` cuida disso internamente, mas vale confirmar
+contraste/legibilidade com o trimpot), debounce dos botões em uso real,
+e o comportamento de reconexão do WebSocket se o backend reiniciar
+enquanto o painel está ligado.
+
 ---
-*(este arquivo é só uma lista de pedidos pra não esquecer -- nenhum
-destes itens foi implementado ainda)*
+*(este arquivo é uma lista de pedidos/decisões do projeto -- itens
+marcados ✅ já foram implementados; os demais ainda não)*
